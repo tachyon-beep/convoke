@@ -27,6 +27,9 @@ import os
 import signal
 import json
 from typing import List, Tuple, Dict, Any, Optional, Callable
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # --- Agent Definitions ---
 
@@ -252,7 +255,7 @@ def create_function_review_task(fn_task):
 
 
 def parse_numbered_list(text: str, max_items: int = 10) -> List[Tuple[str, str]]:
-    """Parse a numbered list of items with multi-line descriptions.
+    """Parse a numbered or bulleted list of items with multi-line descriptions.
 
     Args:
         text (str): The text to parse.
@@ -260,35 +263,26 @@ def parse_numbered_list(text: str, max_items: int = 10) -> List[Tuple[str, str]]
     Returns:
         List[Tuple[str, str]]: List of (name, description) pairs.
     """
-    lines = text.splitlines()
+    if not isinstance(text, str):
+        return []
+    try:
+        lines = text.splitlines()
+    except Exception:
+        return []
     items = []
     current_name = None
     current_desc_lines = []
     for line in lines:
-        m = re.match(r"^\s*(\d+)\.\s*([^:]+):?\s*(.*)$", line)
+        m = re.match(r"^\s*(\d+|[-*])\.?(\s+)([^:]+):?\s*(.*)$", line)
         if m:
             if current_name is not None:
                 items.append((current_name, "\n".join(current_desc_lines).strip()))
-            current_name = m.group(2).strip()
-            desc = m.group(3).strip()
+            current_name = m.group(3).strip()
+            desc = m.group(4).strip()
             current_desc_lines = [desc] if desc else []
-        elif re.match(r"^\s*[-*]\s*([^:]+):?\s*(.*)$", line):
-            # Support for bullet/dash lists as fallback
-            if current_name is not None:
-                items.append((current_name, "\n".join(current_desc_lines).strip()))
-            m2 = re.match(r"^\s*[-*]\s*([^:]+):?\s*(.*)$", line)
-            if m2:  # Check if m2 is not None
-                current_name = m2.group(1).strip()
-                desc = m2.group(2).strip()
-                current_desc_lines = [desc] if desc else []
-            else:  # If m2 is None, reset current_name to avoid issues
-                current_name = None
-                current_desc_lines = []
-        elif current_name is not None and (
-            line.strip() == "" or line.startswith(" ") or line.startswith("\t")
-        ):
+        elif current_name is not None and not re.match(r"^\s*(\d+|[-*])\.?(\s+)", line):
+            # Any non-list-item-start line is a continuation
             current_desc_lines.append(line)
-        # else: skip unrelated lines
     if current_name is not None:
         items.append((current_name, "\n".join(current_desc_lines).strip()))
     return items[:max_items]
@@ -300,8 +294,7 @@ task_counter = {"count": 0}
 
 def run_task_with_review(
     main_task: Task,
-    review_task_fn: Callable,
-    review_args: Optional[Tuple] = None,
+    review_task_fn: Callable[[Task], Task],
     logger: Optional[logging.Logger] = None,
     verbose: int = 0,
 ) -> Dict[str, Any]:
@@ -309,13 +302,10 @@ def run_task_with_review(
 
     Returns a dict with keys: main, review, error (bool), error_msg (str or None).
     """
-    review_args = review_args or ()
     try:
-        review_task = review_task_fn(main_task, *review_args)
-
+        review_task = review_task_fn(main_task)
         main_agent = main_task.agent
         review_agent = review_task.agent
-
         if main_agent is None:
             error_msg = "Main task is missing an agent."
             if logger:
@@ -326,7 +316,6 @@ def run_task_with_review(
                 "error": True,
                 "error_msg": error_msg,
             }
-
         if review_agent is None:
             error_msg = "Review task is missing an agent."
             if logger:
@@ -337,12 +326,11 @@ def run_task_with_review(
                 "error": True,
                 "error_msg": error_msg,
             }
-
         crew = Crew(
             agents=[main_agent, review_agent],
             tasks=[main_task, review_task],
             process=Process.sequential,
-            verbose=(verbose > 0),
+            verbose=bool(verbose),
         )
         crew.kickoff()
         task_counter["count"] += 2
@@ -401,6 +389,7 @@ def run_task_with_review_and_refine(
     verbose: int,
     review_cycles: int,
     parse_retries: int,
+    max_items: int,
 ) -> Dict[str, Any]:
     """Run manager, reviewer, and optional refinement cycles. Returns dict with all outputs."""
     outputs = []
@@ -425,12 +414,17 @@ def run_task_with_review_and_refine(
         for attempt in range(parse_retries):
             try:
                 review_task = create_review_fn(task)
-                if task.agent is None or review_task.agent is None:
+                agents = [
+                    agent
+                    for agent in [task.agent, review_task.agent]
+                    if agent is not None
+                ]
+                if len(agents) != 2:
                     raise ValueError(
                         "Both task.agent and review_task.agent must be non-None."
                     )
                 crew = Crew(
-                    agents=[task.agent, review_task.agent],
+                    agents=agents,
                     tasks=[task, review_task],
                     process=Process.sequential,
                     verbose=bool(verbose),
@@ -447,9 +441,7 @@ def run_task_with_review_and_refine(
                     if hasattr(review_task, "output")
                     else ""
                 )
-                parsed = parse_fn(
-                    main_output, 1
-                )  # Just check if at least one item is parsed
+                parsed = parse_fn(main_output, max_items)
                 if not parsed:
                     logger.warning(
                         f"Parse failed for output in cycle {cycle+1}, attempt {attempt+1}. Retrying..."
@@ -493,22 +485,7 @@ def orchestrate_level(
         [Callable[[str, str], Task], str, str, str, str, int], Task
     ],
     parse_fn: Callable[[str, int], List[Tuple[str, str]]],
-    next_level_fn: Optional[
-        Callable[
-            [
-                List[Tuple[str, str]],
-                int,
-                logging.Logger,
-                int,
-                int,
-                int,
-                int,
-                int,
-                int,
-            ],  # Added int for verbose
-            List[Dict[str, Any]],
-        ]
-    ],
+    next_level_fn: Optional[Callable],
     recursion_depth: int,
     max_depth: int,
     max_items: int,
@@ -565,6 +542,7 @@ def orchestrate_level(
             verbose,
             review_cycles,
             parse_retries,
+            max_items,
         )
         if outputs.get("error"):
             logger.error(f"Critical error in task '{name}': {outputs['error_msg']}")
@@ -586,14 +564,14 @@ def orchestrate_level(
         if next_level_fn:
             next_results = next_level_fn(
                 next_items,
-                recursion_depth + 1,
-                logger,
-                max_depth,
-                max_items,
-                max_tasks,
-                verbose,
-                review_cycles,
-                parse_retries,
+                recursion_depth=recursion_depth + 1,
+                logger=logger,
+                max_depth=max_depth,
+                max_items=max_items,
+                max_tasks=max_tasks,
+                verbose=verbose,
+                review_cycles=review_cycles,
+                parse_retries=parse_retries,
             )
         results.append(
             {
@@ -672,20 +650,30 @@ def orchestrate_full_workflow(
     """
     logger = logger or logging.getLogger(__name__)
     task_counter["count"] = 0
-    architect_task = create_architect_task(requirements)
-    arch_results = run_task_with_review(
-        architect_task, create_architect_review_task, logger=logger, verbose=verbose
+    # Architect-level refinement
+    arch_outputs = run_task_with_review_and_refine(
+        name="System Architecture",
+        desc=requirements,
+        create_task_fn=lambda _, requirements_arg: create_architect_task(requirements_arg),
+        create_review_fn=create_architect_review_task,
+        create_refine_fn=create_refinement_task,
+        parse_fn=parse_numbered_list,
+        logger=logger,
+        verbose=verbose,
+        review_cycles=review_cycles,
+        parse_retries=parse_retries,
+        max_items=max_items
     )
-    if arch_results.get("error"):
-        logger.error(f"Critical error in architecture: {arch_results['error_msg']}")
+    if arch_outputs.get("error"):
+        logger.error(f"Critical error in architecture: {arch_outputs['error_msg']}")
         return {
-            "architecture": arch_results["main"],
-            "architecture_review": arch_results["review"],
+            "architecture": arch_outputs["final_output"],
+            "architecture_review": arch_outputs["final_review"],
             "modules": [],
             "error": True,
-            "error_msg": arch_results["error_msg"],
+            "error_msg": arch_outputs["error_msg"],
         }
-    modules = parse_numbered_list(arch_results["main"], max_items)
+    modules = parse_numbered_list(arch_outputs["final_output"], max_items)
     next_function_level = make_next_level_handler(
         create_function_manager_task,
         create_function_review_task,
@@ -719,8 +707,9 @@ def orchestrate_full_workflow(
         parse_retries,
     )
     return {
-        "architecture": arch_results["main"],
-        "architecture_review": arch_results["review"],
+        "architecture": arch_outputs["final_output"],
+        "architecture_review": arch_outputs["final_review"],
+        "architecture_cycles": arch_outputs["cycles"],
         "modules": modules_result,
         "error": False,
         "error_msg": None,
@@ -822,29 +811,36 @@ def main():
         if results.get("error"):
             logger.error(f"Workflow terminated due to error: {results['error_msg']}")
             return
-        logger.info("System Architecture:\n%s", results["architecture"])
-        logger.info("Architecture Review:\n%s", results["architecture_review"])
+        logger.info(
+            "System Architecture (final, after %d cycle(s)):\n%s",
+            len(results.get("architecture_cycles", [])),
+            results["architecture"],
+        )
+        logger.info("Architecture Review (final):\n%s", results["architecture_review"])
         for mod in results["modules"]:
             logger.info(
-                "Module: %s\nDescription: %s\nReview: %s",
+                "Module: %s\nDescription: %s\nFinal Review: %s\n(Cycles: %d)",
                 mod["name"],
                 mod["description"],
-                mod["review"],
+                mod["final_review"],
+                len(mod["cycles"]),
             )
             for cls in mod["children"]:
                 logger.info(
-                    "  Class: %s\n  Description: %s\n  Review: %s",
+                    "  Class: %s\n  Description: %s\n  Final Review: %s\n  (Cycles: %d)",
                     cls["name"],
                     cls["description"],
-                    cls["review"],
+                    cls["final_review"],
+                    len(cls["cycles"]),
                 )
                 for fn in cls["children"]:
                     logger.info(
-                        "    Function: %s\n    Description: %s\n    Implementation:\n%s\n    Review: %s",
+                        "    Function: %s\n    Description: %s\n    Implementation (final):\n%s\n    Final Review: %s\n    (Cycles: %d)",
                         fn["name"],
                         fn["description"],
-                        fn["main_output"],
-                        fn["review"],
+                        fn["final_output"],
+                        fn["final_review"],
+                        len(fn["cycles"]),
                     )
         print("\n===== JSON SUMMARY =====\n")
         print(json.dumps(results, indent=2))

@@ -56,6 +56,7 @@ def create_architect_agent():
         ),
         verbose=True,
         allow_delegation=False,  # Temporarily disable delegation/tools for debugging
+        model="gpt-4o",  # Specialised LLM for architect
         # tools=[]
     )
 
@@ -141,6 +142,7 @@ def create_function_manager_agent():
         ),
         verbose=True,
         allow_delegation=False,
+        model="gpt-3.5-turbo",  # Specialised LLM for function manager
     )
 
 
@@ -153,6 +155,27 @@ def create_function_reviewer_agent():
             "You are a peer function implementer, skilled at reviewing code for bugs, clarity, and efficiency. "
             "You suggest improvements and spot potential issues."
         ),
+        verbose=True,
+        allow_delegation=False,
+    )
+
+
+def create_test_developer_agent():
+    return Agent(
+        role="Test Developer",
+        goal="Write a unit test for the given function implementation.",
+        backstory="You are responsible for writing clear, effective unit tests for Python functions, using pytest conventions.",
+        verbose=True,
+        allow_delegation=False,
+        model="gpt-3.5-turbo",  # Specialised LLM for test developer
+    )
+
+
+def create_test_reviewer_agent():
+    return Agent(
+        role="Test Reviewer",
+        goal="Critique and enhance the unit test for correctness and coverage.",
+        backstory="You are a peer test developer, skilled at reviewing unit tests for completeness and effectiveness.",
         verbose=True,
         allow_delegation=False,
     )
@@ -187,6 +210,7 @@ def create_architect_review_task(arch_task):
         expected_output="A critique and enhancement suggestions for the architecture.",
         agent=create_architect_reviewer_agent(),
         context=[arch_task],
+        human_input=True,  # Require human approval for architect review
     )
 
 
@@ -268,6 +292,27 @@ def create_function_review_task(fn_task):
         expected_output="A critique and enhancement suggestions for the function implementation.",
         agent=create_function_reviewer_agent(),
         context=[fn_task],
+    )
+
+
+def create_test_developer_task(function_name, function_code):
+    return Task(
+        description=(
+            f"Write a pytest-style unit test for the following function '{function_name}'. "
+            f"The test should be in a single code block, with no extra text.\n"
+            f"Function implementation:\n{function_code}"
+        ),
+        expected_output="A complete pytest-style unit test for the function, as a code block.",
+        agent=create_test_developer_agent(),
+    )
+
+
+def create_test_review_task(test_task):
+    return Task(
+        description="Review the unit test for correctness, coverage, and clarity. Suggest improvements if needed.",
+        expected_output="A critique and enhancement suggestions for the unit test.",
+        agent=create_test_reviewer_agent(),
+        context=[test_task],
     )
 
 
@@ -510,28 +555,24 @@ def run_task_with_review_and_refine(
                     if (
                         hasattr(task.output, "pydantic")
                         and task.output.pydantic is not None
+                        and isinstance(task.output.pydantic, ItemListOutput)
                     ):
-                        logger.info(f"Using task.output.pydantic for '{name}'")
-                        if isinstance(task.output.pydantic, ItemListOutput):
-                            pydantic_model = task.output.pydantic
-                            parsed = [
-                                (item.name, item.description)
-                                for item in pydantic_model.items
-                            ]
-                            main_output = pydantic_model.model_dump_json(indent=2)
-                        else:
-                            logger.warning(
-                                f"task.output.pydantic for '{name}' is not of type ItemListOutput. Type: {type(task.output.pydantic)}. Falling back to raw."
-                            )
-                            main_output = getattr(task.output, "raw", "")
-                            parsed = parse_json_list(main_output, max_items)
+                        logger.info(
+                            f"Using task.output.pydantic for '{name}' (ItemListOutput)"
+                        )
+                        pydantic_model = task.output.pydantic
+                        parsed = [
+                            (item.name, item.description)
+                            for item in pydantic_model.items
+                        ]
+                        main_output = pydantic_model.model_dump_json(indent=2)
                     elif (
                         hasattr(task.output, "raw")
                         and task.output.raw
                         and task.output.raw.strip()
                     ):
-                        logger.info(
-                            f"Using task.output.raw for '{name}' as pydantic output was not available."
+                        logger.warning(
+                            f"Falling back to raw output for '{name}' (pydantic output not available or wrong type)"
                         )
                         main_output = task.output.raw
                         parsed = parse_json_list(main_output, max_items)
@@ -748,6 +789,7 @@ def orchestrate_full_workflow(
     logger: Optional[logging.Logger] = None,
     review_cycles: int = 1,
     parse_retries: int = 1,
+    output_dir: str = "output",
 ) -> Dict[str, Any]:
     """Orchestrate the full hierarchical workflow with peer review at each level.
 
@@ -760,6 +802,7 @@ def orchestrate_full_workflow(
         logger (logging.Logger, optional): Logger instance.
         review_cycles (int): Number of review/refinement cycles per task.
         parse_retries (int): Number of times to retry a task if output parsing fails.
+        output_dir (str): Directory to save the outputs.
     Returns:
         Dict[str, Any]: Nested results for all levels.
     """
@@ -853,6 +896,103 @@ def orchestrate_full_workflow(
         review_cycles,
         parse_retries,
     )
+    # Save architecture design and review
+    ensure_dir_exists(output_dir)
+    write_json_file(
+        os.path.join(output_dir, "architecture.json"),
+        json.loads(arch_outputs["final_output"]),
+    )
+    write_text_file(
+        os.path.join(output_dir, "architecture_review.txt"),
+        arch_outputs["final_review"] or "",
+    )
+
+    def save_module_tree(modules, parent_dir):
+        for mod in modules:
+            mod_dir = os.path.join(parent_dir, mod["name"].replace(" ", "_"))
+            ensure_dir_exists(mod_dir)
+            # Save module design and review
+            write_json_file(
+                os.path.join(mod_dir, "module_design.json"),
+                {
+                    "name": mod["name"],
+                    "description": mod["description"],
+                    "cycles": mod["cycles"],
+                    "final_output": mod["final_output"],
+                },
+            )
+            write_text_file(
+                os.path.join(mod_dir, "module_review.txt"), mod["final_review"] or ""
+            )
+            for cls in mod.get("children", []):
+                cls_dir = os.path.join(mod_dir, cls["name"].replace(" ", "_"))
+                ensure_dir_exists(cls_dir)
+                # Save class design and review
+                write_json_file(
+                    os.path.join(cls_dir, "class_design.json"),
+                    {
+                        "name": cls["name"],
+                        "description": cls["description"],
+                        "cycles": cls["cycles"],
+                        "final_output": cls["final_output"],
+                    },
+                )
+                write_text_file(
+                    os.path.join(cls_dir, "class_review.txt"), cls["final_review"] or ""
+                )
+                for fn in cls.get("children", []):
+                    # Save function code and review
+                    fn_file = os.path.join(
+                        cls_dir, f"{fn['name'].replace(' ', '_')}.py"
+                    )
+                    write_text_file(fn_file, fn["final_output"] or "")
+                    write_text_file(
+                        os.path.join(
+                            cls_dir, f"{fn['name'].replace(' ', '_')}_review.txt"
+                        ),
+                        fn["final_review"] or "",
+                    )
+                    # Lint the function code and save lint results
+                    if fn["final_output"]:
+                        lint_result = lint_python_code(fn["final_output"])
+                        write_text_file(
+                            os.path.join(
+                                cls_dir, f"{fn['name'].replace(' ', '_')}_lint.txt"
+                            ),
+                            lint_result,
+                        )
+                        # Generate and review unit test
+                        test_task = create_test_developer_task(
+                            fn["name"], fn["final_output"]
+                        )
+                        test_review_task = create_test_review_task(test_task)
+                        test_crew = Crew(
+                            agents=[test_task.agent, test_review_task.agent],
+                            tasks=[test_task, test_review_task],
+                            process=Process.sequential,
+                            verbose=False,
+                        )
+                        test_crew.kickoff()
+                        test_code = getattr(test_task.output, "raw", "")
+                        test_review = getattr(test_review_task.output, "raw", "")
+                        # Save test code and review
+                        test_file = os.path.join(
+                            cls_dir, f"test_{fn['name'].replace(' ', '_')}.py"
+                        )
+                        write_text_file(test_file, test_code)
+                        write_text_file(
+                            os.path.join(
+                                cls_dir,
+                                f"test_{fn['name'].replace(' ', '_')}_review.txt",
+                            ),
+                            test_review,
+                        )
+
+    save_module_tree(modules_result, output_dir)
+    # Project scaffolding
+    write_project_scaffolding(output_dir, arch_outputs["final_output"], modules_result)
+    # Visualization
+    write_tree_visualization(output_dir, modules_result)
     return {
         "architecture": arch_outputs["final_output"],
         "architecture_review": arch_outputs["final_review"],
@@ -880,6 +1020,81 @@ def ensure_api_keys():
     os.environ["OPENAI_API_KEY"] = openai_key  # Explicitly set for downstream consumers
     # Add other keys as needed
     # os.environ["SERPER_API_KEY"] = os.getenv("SERPER_API_KEY", "")
+
+
+def ensure_dir_exists(path: str):
+    os.makedirs(path, exist_ok=True)
+
+
+def write_json_file(path: str, data: dict):
+    ensure_dir_exists(os.path.dirname(path))
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+
+def write_text_file(path: str, text: str):
+    ensure_dir_exists(os.path.dirname(path))
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+
+
+import subprocess
+
+
+def lint_python_code(code: str) -> str:
+    """Run flake8 linter on the given Python code string and return the linting output."""
+    import tempfile
+
+    with tempfile.NamedTemporaryFile(mode="w+", suffix=".py", delete=False) as tmp:
+        tmp.write(code)
+        tmp.flush()
+        tmp_path = tmp.name
+    try:
+        result = subprocess.run(["flake8", tmp_path], capture_output=True, text=True)
+        lint_output = result.stdout + result.stderr
+    finally:
+        os.unlink(tmp_path)
+    return lint_output.strip()
+
+
+def write_project_scaffolding(
+    output_dir: str, architecture: str, modules: list
+) -> None:
+    # README.md
+    readme_path = os.path.join(output_dir, "README.md")
+    module_list = "\n".join(f"- {mod['name']}: {mod['description']}" for mod in modules)
+    readme_content = f"""# Generated Project\n\n## System Architecture\n\n{architecture}\n\n## Modules\n\n{module_list}\n\n## How to Run Tests\n\n```bash\npytest\n```\n"""
+    write_text_file(readme_path, readme_content)
+    # requirements.txt
+    requirements_path = os.path.join(output_dir, "requirements.txt")
+    requirements_content = "pytest\nflake8\n"
+    write_text_file(requirements_path, requirements_content)
+    # .gitignore
+    gitignore_path = os.path.join(output_dir, ".gitignore")
+    gitignore_content = "__pycache__/\n*.pyc\n.env\noutput/\n"
+    write_text_file(gitignore_path, gitignore_content)
+
+
+def write_tree_visualization(output_dir: str, modules: list):
+    """Write a text-based tree of the generated project structure."""
+
+    def walk_module_tree(modules, prefix=""):
+        lines = []
+        for mod in modules:
+            mod_name = mod["name"].replace(" ", "_")
+            lines.append(f"{prefix}├─ {mod_name}/")
+            for cls in mod.get("children", []):
+                cls_name = cls["name"].replace(" ", "_")
+                lines.append(f"{prefix}│   ├─ {cls_name}/")
+                for fn in cls.get("children", []):
+                    fn_name = fn["name"].replace(" ", "_")
+                    lines.append(f"{prefix}│   │   ├─ {fn_name}.py")
+                    lines.append(f"{prefix}│   │   ├─ test_{fn_name}.py")
+        return lines
+
+    tree_lines = ["output/"] + walk_module_tree(modules)
+    tree_path = os.path.join(output_dir, "PROJECT_TREE.txt")
+    write_text_file(tree_path, "\n".join(tree_lines))
 
 
 def main():

@@ -41,3 +41,7 @@ build/
 dist/
 *.egg-info/
 .eggs/
+
+# Project Files
+projects/*
+output/**

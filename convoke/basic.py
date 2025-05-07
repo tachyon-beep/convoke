@@ -156,10 +156,11 @@ def create_architect_task(requirements):
         description=(
             f"Analyze the following requirements and design a modular system. "
             f"List the modules needed, and for each, briefly describe its purpose. "
-            f"Spawn a module manager for each module to handle its design.\n\n"
+            f"Output MUST be a JSON array of objects, each with 'name' and 'description' fields, e.g.\n"
+            f"[{{'name': 'ModuleName', 'description': 'Purpose of the module'}}, ...] (no extra text).\n"
             f"Requirements: {requirements}"
         ),
-        expected_output="A list of modules with descriptions. Each module will be handled by a module manager.",
+        expected_output="A JSON array of objects, each with 'name' and 'description' fields.",
         agent=create_architect_agent(),
     )
 
@@ -183,9 +184,10 @@ def create_module_manager_task(module_name, module_description):
         description=(
             f"Design the module '{module_name}': {module_description}. "
             f"List the classes needed, and for each, briefly describe its purpose. "
-            f"Spawn a class manager for each class."
+            f"Output MUST be a JSON array of objects, each with 'name' and 'description' fields, e.g.\n"
+            f"[{{'name': 'ClassName', 'description': 'Purpose of the class'}}, ...] (no extra text)."
         ),
-        expected_output="A list of classes with descriptions. Each class will be handled by a class manager.",
+        expected_output="A JSON array of objects, each with 'name' and 'description' fields.",
         agent=create_module_manager_agent(),
     )
 
@@ -209,9 +211,10 @@ def create_class_manager_task(class_name, class_description):
         description=(
             f"Design the class '{class_name}': {class_description}. "
             f"List the functions/methods needed, and for each, briefly describe its purpose. "
-            f"Spawn a function manager for each function."
+            f"Output MUST be a JSON array of objects, each with 'name' and 'description' fields, e.g.\n"
+            f"[{{'name': 'FunctionName', 'description': 'Purpose of the function'}}, ...] (no extra text)."
         ),
-        expected_output="A list of functions/methods with descriptions. Each will be handled by a function manager.",
+        expected_output="A JSON array of objects, each with 'name' and 'description' fields.",
         agent=create_class_manager_agent(),
     )
 
@@ -288,6 +291,54 @@ def parse_numbered_list(text: str, max_items: int = 10) -> List[Tuple[str, str]]
     return items[:max_items]
 
 
+def parse_json_list(
+    text: str, max_items: int = 10, logger: Optional[logging.Logger] = None
+) -> List[Tuple[str, str]]:
+    """Parse a JSON string representing a list of objects into (name, description) tuples."""
+    local_logger = logger or logging.getLogger(__name__)
+    if not isinstance(text, str) or not text.strip():
+        return []
+    try:
+        # LLMs sometimes wrap JSON in markdown ```json ... ```
+        match = re.search(r"(\[[\s\S]*\])", text)
+        if not match:
+            local_logger.warning(
+                f"Could not find a JSON array structure in text: {text[:200]}..."
+            )
+            return []
+        json_text = match.group(1)
+        data = json.loads(json_text)
+        items = []
+        if isinstance(data, list):
+            for item_dict in data:
+                if (
+                    isinstance(item_dict, dict)
+                    and "name" in item_dict
+                    and "description" in item_dict
+                ):
+                    items.append(
+                        (str(item_dict["name"]), str(item_dict["description"]))
+                    )
+                else:
+                    local_logger.warning(
+                        f"Skipping invalid item in JSON list: {item_dict}"
+                    )
+            return items[:max_items]
+        else:
+            local_logger.warning(f"Parsed JSON is not a list: {type(data)}")
+            return []
+    except json.JSONDecodeError as e:
+        local_logger.error(
+            f"JSONDecodeError parsing text: {e}\nText was: {text[:500]}..."
+        )
+        return []
+    except Exception as e:
+        local_logger.error(
+            f"Unexpected error parsing JSON: {e}\nText was: {text[:500]}..."
+        )
+        return []
+
+
 # --- Task Counter for Throttling ---
 task_counter = {"count": 0}
 
@@ -361,17 +412,18 @@ def create_refinement_task(
     original_output: str,
     review_output: str,
     cycle: int,
+    output_format_instruction: str,
 ) -> Task:
-    """Create a refinement task for a manager agent, using review as context."""
     return Task(
         description=(
             f"Refine your previous output for '{name}'.\n"
             f"Original description: {desc}\n"
             f"Your previous output:\n{original_output}\n"
             f"Peer review feedback:\n{review_output}\n"
-            f"This is refinement cycle {cycle}. Please address the review feedback and output in the required format: Each item MUST be in the format '1. Name: Description' (one per line, no extra text)."
+            f"This is refinement cycle {cycle}. Please address the review feedback. "
+            f"{output_format_instruction}"
         ),
-        expected_output="A revised list in the required format.",
+        expected_output="A revised output in the specified format.",
         agent=create_task_fn(name, desc).agent,
     )
 
@@ -435,6 +487,9 @@ def run_task_with_review_and_refine(
                     getattr(task.output, "raw_output", "")
                     if hasattr(task, "output")
                     else ""
+                )
+                logger.debug(
+                    f"Attempting to parse main_output for '{name}' (cycle {cycle+1}, attempt {attempt+1}):\n'''{main_output}'''"
                 )
                 review_output = (
                     getattr(review_task.output, "raw_output", "")
@@ -651,6 +706,13 @@ def orchestrate_full_workflow(
     logger = logger or logging.getLogger(__name__)
     task_counter["count"] = 0
     # Architect-level refinement
+    json_output_instruction = (
+        "Output MUST be a JSON array of objects, each with 'name' and 'description' fields, "
+        "e.g. [{'name': 'ModuleName', 'description': 'Purpose of the module'}, ...] (no extra text)."
+    )
+    architect_create_refine_fn = lambda ctf, n, d, oo, ro, cyc: create_refinement_task(
+        ctf, n, d, oo, ro, cyc, json_output_instruction
+    )
     arch_outputs = run_task_with_review_and_refine(
         name="System Architecture",
         desc=requirements,
@@ -658,8 +720,10 @@ def orchestrate_full_workflow(
             requirements_arg
         ),
         create_review_fn=create_architect_review_task,
-        create_refine_fn=create_refinement_task,
-        parse_fn=parse_numbered_list,
+        create_refine_fn=architect_create_refine_fn,
+        parse_fn=lambda text, max_items: parse_json_list(
+            text, max_items, logger=logger
+        ),
         logger=logger,
         verbose=verbose,
         review_cycles=review_cycles,
@@ -675,26 +739,30 @@ def orchestrate_full_workflow(
             "error": True,
             "error_msg": arch_outputs["error_msg"],
         }
-    modules = parse_numbered_list(arch_outputs["final_output"], max_items)
+    modules = parse_json_list(arch_outputs["final_output"], max_items, logger=logger)
+    numbered_list_instruction = "Output in the required format: Each item MUST be in the format '1. Name: Description' (one per line, no extra text)."
+    default_create_refine_fn = lambda ctf, n, d, oo, ro, cyc: create_refinement_task(
+        ctf, n, d, oo, ro, cyc, numbered_list_instruction
+    )
     next_function_level = make_next_level_handler(
         create_function_manager_task,
         create_function_review_task,
-        create_refinement_task,
+        default_create_refine_fn,
         lambda x, _: [],
         None,
     )
     next_class_level = make_next_level_handler(
         create_class_manager_task,
         create_class_review_task,
-        create_refinement_task,
-        parse_numbered_list,
+        default_create_refine_fn,
+        parse_json_list,
         next_function_level,
     )
     next_module_level = make_next_level_handler(
         create_module_manager_task,
         create_module_review_task,
-        create_refinement_task,
-        parse_numbered_list,
+        default_create_refine_fn,
+        parse_json_list,
         next_class_level,
     )
     modules_result = next_module_level(

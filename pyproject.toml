@@ -12,6 +12,7 @@ python = ">=3.12,<3.13"
 crewai = "^0.118.0"
 openai = "^1.77.0"
 crewai-tools = "^0.43.0"
+dotenv = "^0.9.9"
 
 
 [tool.poetry.group.dev.dependencies]

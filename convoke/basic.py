@@ -654,7 +654,9 @@ def orchestrate_full_workflow(
     arch_outputs = run_task_with_review_and_refine(
         name="System Architecture",
         desc=requirements,
-        create_task_fn=lambda _, requirements_arg: create_architect_task(requirements_arg),
+        create_task_fn=lambda _, requirements_arg: create_architect_task(
+            requirements_arg
+        ),
         create_review_fn=create_architect_review_task,
         create_refine_fn=create_refinement_task,
         parse_fn=parse_numbered_list,
@@ -662,7 +664,7 @@ def orchestrate_full_workflow(
         verbose=verbose,
         review_cycles=review_cycles,
         parse_retries=parse_retries,
-        max_items=max_items
+        max_items=max_items,
     )
     if arch_outputs.get("error"):
         logger.error(f"Critical error in architecture: {arch_outputs['error_msg']}")

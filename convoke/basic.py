@@ -366,10 +366,132 @@ def run_task_with_review(
         return {"main": "", "review": f"ERROR: {e}", "error": True, "error_msg": str(e)}
 
 
+def create_refinement_task(
+    create_task_fn: Callable[[str, str], Task],
+    name: str,
+    desc: str,
+    original_output: str,
+    review_output: str,
+    cycle: int,
+) -> Task:
+    """Create a refinement task for a manager agent, using review as context."""
+    return Task(
+        description=(
+            f"Refine your previous output for '{name}'.\n"
+            f"Original description: {desc}\n"
+            f"Your previous output:\n{original_output}\n"
+            f"Peer review feedback:\n{review_output}\n"
+            f"This is refinement cycle {cycle}. Please address the review feedback and output in the required format: Each item MUST be in the format '1. Name: Description' (one per line, no extra text)."
+        ),
+        expected_output="A revised list in the required format.",
+        agent=create_task_fn(name, desc).agent,
+    )
+
+
+def run_task_with_review_and_refine(
+    name: str,
+    desc: str,
+    create_task_fn: Callable[[str, str], Task],
+    create_review_fn: Callable[[Task], Task],
+    create_refine_fn: Callable[
+        [Callable[[str, str], Task], str, str, str, str, int], Task
+    ],
+    parse_fn: Callable[[str, int], List[Tuple[str, str]]],
+    logger: logging.Logger,
+    verbose: int,
+    review_cycles: int,
+    parse_retries: int,
+) -> Dict[str, Any]:
+    """Run manager, reviewer, and optional refinement cycles. Returns dict with all outputs."""
+    outputs = []
+    current_output = None
+    current_review = None
+    error = False
+    error_msg = None
+    for cycle in range(review_cycles):
+        # Manager or refinement task
+        if cycle == 0:
+            task = create_task_fn(name, desc)
+        else:
+            task = create_refine_fn(
+                create_task_fn,
+                name,
+                desc,
+                current_output if current_output is not None else "",
+                current_review if current_review is not None else "",
+                cycle,
+            )
+        # Retry on parse failure
+        for attempt in range(parse_retries):
+            try:
+                review_task = create_review_fn(task)
+                if task.agent is None or review_task.agent is None:
+                    raise ValueError(
+                        "Both task.agent and review_task.agent must be non-None."
+                    )
+                crew = Crew(
+                    agents=[task.agent, review_task.agent],
+                    tasks=[task, review_task],
+                    process=Process.sequential,
+                    verbose=bool(verbose),
+                )
+                crew.kickoff()
+                task_counter["count"] += 2
+                main_output = (
+                    getattr(task.output, "raw_output", "")
+                    if hasattr(task, "output")
+                    else ""
+                )
+                review_output = (
+                    getattr(review_task.output, "raw_output", "")
+                    if hasattr(review_task, "output")
+                    else ""
+                )
+                parsed = parse_fn(
+                    main_output, 1
+                )  # Just check if at least one item is parsed
+                if not parsed:
+                    logger.warning(
+                        f"Parse failed for output in cycle {cycle+1}, attempt {attempt+1}. Retrying..."
+                    )
+                    if attempt == parse_retries - 1:
+                        error = True
+                        error_msg = f"Parse failed after {parse_retries} attempts."
+                        break
+                    continue
+                current_output = main_output
+                current_review = review_output
+                outputs.append(
+                    {
+                        "cycle": cycle + 1,
+                        "main_output": main_output,
+                        "review": review_output,
+                    }
+                )
+                break
+            except Exception as e:
+                logger.error(f"Task or review failed: {e}")
+                error = True
+                error_msg = str(e)
+                break
+        if error:
+            break
+    return {
+        "cycles": outputs,
+        "final_output": current_output,
+        "final_review": current_review,
+        "error": error,
+        "error_msg": error_msg,
+    }
+
+
 def orchestrate_level(
     items: List[Tuple[str, str]],
     create_task_fn: Callable[[str, str], Task],
     create_review_fn: Callable[[Task], Task],
+    create_refine_fn: Callable[
+        [Callable[[str, str], Task], str, str, str, str, int], Task
+    ],
     parse_fn: Callable[[str, int], List[Tuple[str, str]]],
     next_level_fn: Optional[
         Callable[
@@ -377,6 +499,8 @@ def orchestrate_level(
                 List[Tuple[str, str]],
                 int,
                 logging.Logger,
+                int,
+                int,
                 int,
                 int,
                 int,
@@ -391,6 +515,8 @@ def orchestrate_level(
     logger: logging.Logger,
     max_tasks: int,
     verbose: int,
+    review_cycles: int,
+    parse_retries: int,
 ) -> List[Dict[str, Any]]:
     """
     Generic recursive orchestration for modules/classes/functions.
@@ -407,13 +533,15 @@ def orchestrate_level(
         logger: Logger instance.
         max_tasks: Maximum total tasks allowed.
         verbose: Crew/agent verbosity level.
+        review_cycles: Number of review/refinement cycles per task.
+        parse_retries: Number of times to retry a task if output parsing fails.
     Returns:
         List[Dict[str, Any]]: Results for this level.
 
     Example:
         orchestrate_level(
             items, create_module_manager_task, create_module_review_task, parse_numbered_list, next_class_level,
-            recursion_depth, max_depth, max_items, logger, max_tasks, verbose
+            recursion_depth, max_depth, max_items, logger, max_tasks, verbose, review_cycles, parse_retries
         )
     """
     if recursion_depth > max_depth:
@@ -426,8 +554,17 @@ def orchestrate_level(
         if task_counter["count"] >= max_tasks:
             logger.warning(f"Task cap reached ({max_tasks}). Halting further spawning.")
             break
-        outputs = run_task_with_review(
-            create_task_fn(name, desc), create_review_fn, logger=logger, verbose=verbose
+        outputs = run_task_with_review_and_refine(
+            name,
+            desc,
+            create_task_fn,
+            create_review_fn,
+            create_refine_fn,
+            parse_fn,
+            logger,
+            verbose,
+            review_cycles,
+            parse_retries,
         )
         if outputs.get("error"):
             logger.error(f"Critical error in task '{name}': {outputs['error_msg']}")
@@ -435,15 +572,16 @@ def orchestrate_level(
                 {
                     "name": name,
                     "description": desc,
-                    "main_output": outputs["main"],
-                    "review": outputs["review"],
+                    "cycles": outputs["cycles"],
+                    "final_output": outputs["final_output"],
+                    "final_review": outputs["final_review"],
                     "children": [],
                     "error": True,
                     "error_msg": outputs["error_msg"],
                 }
             )
-            break  # Stop further processing on error
-        next_items = parse_fn(outputs["main"], max_items)
+            break
+        next_items = parse_fn(outputs["final_output"], max_items)
         next_results = []
         if next_level_fn:
             next_results = next_level_fn(
@@ -454,13 +592,16 @@ def orchestrate_level(
                 max_items,
                 max_tasks,
                 verbose,
+                review_cycles,
+                parse_retries,
             )
         results.append(
             {
                 "name": name,
                 "description": desc,
-                "main_output": outputs["main"],
-                "review": outputs["review"],
+                "cycles": outputs["cycles"],
+                "final_output": outputs["final_output"],
+                "final_review": outputs["final_review"],
                 "children": next_results,
                 "error": False,
                 "error_msg": None,
@@ -469,16 +610,27 @@ def orchestrate_level(
     return results
 
 
-def make_next_level_handler(create_task_fn, create_review_fn, parse_fn, next_level_fn):
+def make_next_level_handler(
+    create_task_fn, create_review_fn, create_refine_fn, parse_fn, next_level_fn
+):
     """Factory for next-level orchestration handlers."""
 
     def handler(
-        items, recursion_depth, logger, max_depth, max_items, max_tasks, verbose
+        items,
+        recursion_depth,
+        logger,
+        max_depth,
+        max_items,
+        max_tasks,
+        verbose,
+        review_cycles,
+        parse_retries,
     ):
         return orchestrate_level(
             items,
             create_task_fn,
             create_review_fn,
+            create_refine_fn,
             parse_fn,
             next_level_fn,
             recursion_depth,
@@ -487,6 +639,8 @@ def make_next_level_handler(create_task_fn, create_review_fn, parse_fn, next_lev
             logger,
             max_tasks,
             verbose,
+            review_cycles,
+            parse_retries,
         )
 
     return handler
@@ -499,6 +653,8 @@ def orchestrate_full_workflow(
     max_tasks: int = 100,
     verbose: int = 0,
     logger: Optional[logging.Logger] = None,
+    review_cycles: int = 1,
+    parse_retries: int = 1,
 ) -> Dict[str, Any]:
     """Orchestrate the full hierarchical workflow with peer review at each level.
 
@@ -509,6 +665,8 @@ def orchestrate_full_workflow(
         max_tasks (int): Maximum total tasks allowed.
         verbose (int): Crew/agent verbosity level.
         logger (logging.Logger, optional): Logger instance.
+        review_cycles (int): Number of review/refinement cycles per task.
+        parse_retries (int): Number of times to retry a task if output parsing fails.
     Returns:
         Dict[str, Any]: Nested results for all levels.
     """
@@ -529,22 +687,36 @@ def orchestrate_full_workflow(
         }
     modules = parse_numbered_list(arch_results["main"], max_items)
     next_function_level = make_next_level_handler(
-        create_function_manager_task, create_function_review_task, lambda x, _: [], None
+        create_function_manager_task,
+        create_function_review_task,
+        create_refinement_task,
+        lambda x, _: [],
+        None,
     )
     next_class_level = make_next_level_handler(
         create_class_manager_task,
         create_class_review_task,
+        create_refinement_task,
         parse_numbered_list,
         next_function_level,
     )
     next_module_level = make_next_level_handler(
         create_module_manager_task,
         create_module_review_task,
+        create_refinement_task,
         parse_numbered_list,
         next_class_level,
     )
     modules_result = next_module_level(
-        modules, 1, logger, max_depth, max_items, max_tasks, verbose
+        modules,
+        1,
+        logger,
+        max_depth,
+        max_items,
+        max_tasks,
+        verbose,
+        review_cycles,
+        parse_retries,
     )
     return {
         "architecture": arch_results["main"],
@@ -605,6 +777,18 @@ def main():
         default=0,
         help="Verbosity level for Crew/agents and logging (0=INFO, 1=DEBUG, 2+=DEBUG+). Default: 0.",
     )
+    parser.add_argument(
+        "--review-cycles",
+        type=int,
+        default=1,
+        help="Number of review/refinement cycles per task (default: 1)",
+    )
+    parser.add_argument(
+        "--parse-retries",
+        type=int,
+        default=1,
+        help="Number of times to retry a task if output parsing fails (default: 1)",
+    )
     args = parser.parse_args()
     ensure_api_keys()
     requirements = args.requirements or (
@@ -632,6 +816,8 @@ def main():
             max_tasks=args.max_tasks,
             verbose=args.verbose,
             logger=logger,
+            review_cycles=args.review_cycles,
+            parse_retries=args.parse_retries,
         )
         if results.get("error"):
             logger.error(f"Workflow terminated due to error: {results['error_msg']}")

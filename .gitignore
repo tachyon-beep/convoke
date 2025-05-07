@@ -1,0 +1,43 @@
+# Bytecode and cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+
+# Poetry-specific
+poetry.lock
+
+# Test results
+*.cover
+coverage.xml
+htmlcov/
+.tox/
+.pytest_cache/
+
+# Linting/mypy
+.mypy_cache/
+.dmypy.json
+ruff_cache/
+
+# Editors and OS files
+*.swp
+*.swo
+.idea/
+.vscode/
+*.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+.eggs/

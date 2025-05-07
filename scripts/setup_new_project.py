@@ -61,7 +61,10 @@ def main():
     else:
         req_text = "TODO: Add project-specific requirements here."
 
-    config_content = template.replace("INSERT_PROJECT_REQUIREMENTS_HERE", req_text)
+    # Replace both possible placeholders for requirements
+    config_content = template.replace(
+        "INSERT_PROJECT_REQUIREMENTS_HERE", req_text
+    ).replace("TODO: Insert project-specific requirements here", req_text)
     config_path = os.path.join(project_root, "config.yaml")
     write_file(config_path, config_content)
 

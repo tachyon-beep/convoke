@@ -28,8 +28,19 @@ import signal
 import json
 from typing import List, Tuple, Dict, Any, Optional, Callable
 from dotenv import load_dotenv
+from pydantic import BaseModel, Field, RootModel
 
 load_dotenv()
+
+
+class ItemDetail(BaseModel):
+    name: str = Field(description="Name of the item (e.g., module, class, function)")
+    description: str = Field(description="Purpose or description of the item")
+
+
+class ItemListOutput(BaseModel):
+    items: List[ItemDetail]
+
 
 # --- Agent Definitions ---
 
@@ -41,11 +52,11 @@ def create_architect_agent():
         goal="Design a robust, modular software system for the given requirements.",
         backstory=(
             "You are a highly experienced systems architect. You break down complex requirements "
-            "into high-level modules, ensuring scalability and maintainability. You delegate module "
-            "design to module managers."
+            "into high-level modules, ensuring scalability and maintainability."
         ),
         verbose=True,
-        allow_delegation=True,
+        allow_delegation=False,  # Temporarily disable delegation/tools for debugging
+        # tools=[]
     )
 
 
@@ -155,13 +166,14 @@ def create_architect_task(requirements):
     return Task(
         description=(
             f"Analyze the following requirements and design a modular system. "
-            f"List the modules needed, and for each, briefly describe its purpose. "
-            f"Output MUST be a JSON array of objects, each with 'name' and 'description' fields, e.g.\n"
-            f"[{{'name': 'ModuleName', 'description': 'Purpose of the module'}}, ...] (no extra text).\n"
+            f"Your ENTIRE response must be a JSON object with a single key 'items', whose value is a list of objects, each with 'name' and 'description' fields. "
+            f"Example: {{'items': [{{'name': 'ExampleModule', 'description': 'This is an example.'}}]}}\n"
+            f"Do not include any markdown, comments, or any text outside the JSON object itself.\n"
             f"Requirements: {requirements}"
         ),
-        expected_output="A JSON array of objects, each with 'name' and 'description' fields.",
+        expected_output="A JSON object with an 'items' key, whose value is a list of objects with 'name' and 'description' fields, strictly conforming to the ItemListOutput schema. No extra text.",
         agent=create_architect_agent(),
+        output_pydantic=ItemListOutput,
     )
 
 
@@ -183,12 +195,13 @@ def create_module_manager_task(module_name, module_description):
     return Task(
         description=(
             f"Design the module '{module_name}': {module_description}. "
-            f"List the classes needed, and for each, briefly describe its purpose. "
-            f"Output MUST be a JSON array of objects, each with 'name' and 'description' fields, e.g.\n"
-            f"[{{'name': 'ClassName', 'description': 'Purpose of the class'}}, ...] (no extra text)."
+            f"Output MUST be a JSON object with a single key 'items', whose value is a list of objects, each with 'name' and 'description' fields. "
+            f"Example: {{'items': [{{'name': 'ExampleClass', 'description': 'This is an example.'}}]}}\n"
+            f"Do not include any markdown, comments, or any text outside the JSON object itself."
         ),
-        expected_output="A JSON array of objects, each with 'name' and 'description' fields.",
+        expected_output="A JSON object with an 'items' key, whose value is a list of objects with 'name' and 'description' fields, strictly conforming to the ItemListOutput schema. No extra text.",
         agent=create_module_manager_agent(),
+        output_pydantic=ItemListOutput,
     )
 
 
@@ -210,12 +223,13 @@ def create_class_manager_task(class_name, class_description):
     return Task(
         description=(
             f"Design the class '{class_name}': {class_description}. "
-            f"List the functions/methods needed, and for each, briefly describe its purpose. "
-            f"Output MUST be a JSON array of objects, each with 'name' and 'description' fields, e.g.\n"
-            f"[{{'name': 'FunctionName', 'description': 'Purpose of the function'}}, ...] (no extra text)."
+            f"Output MUST be a JSON object with a single key 'items', whose value is a list of objects, each with 'name' and 'description' fields. "
+            f"Example: {{'items': [{{'name': 'ExampleFunction', 'description': 'This is an example.'}}]}}\n"
+            f"Do not include any markdown, comments, or any text outside the JSON object itself."
         ),
-        expected_output="A JSON array of objects, each with 'name' and 'description' fields.",
+        expected_output="A JSON object with an 'items' key, whose value is a list of objects with 'name' and 'description' fields, strictly conforming to the ItemListOutput schema. No extra text.",
         agent=create_class_manager_agent(),
+        output_pydantic=ItemListOutput,
     )
 
 
@@ -297,13 +311,18 @@ def parse_json_list(
     """Parse a JSON string representing a list of objects into (name, description) tuples."""
     local_logger = logger or logging.getLogger(__name__)
     if not isinstance(text, str) or not text.strip():
+        if text is None:
+            local_logger.warning("parse_json_list received None input.")
+        elif not text.strip():
+            local_logger.warning(
+                "parse_json_list received empty or whitespace-only string."
+            )
         return []
     try:
-        # LLMs sometimes wrap JSON in markdown ```json ... ```
         match = re.search(r"(\[[\s\S]*\])", text)
         if not match:
             local_logger.warning(
-                f"Could not find a JSON array structure in text: {text[:200]}..."
+                f"parse_json_list: Could not find a JSON array structure in text starting with: {text[:200]}..."
             )
             return []
         json_text = match.group(1)
@@ -321,20 +340,22 @@ def parse_json_list(
                     )
                 else:
                     local_logger.warning(
-                        f"Skipping invalid item in JSON list: {item_dict}"
+                        f"parse_json_list: Skipping invalid item in JSON list: {item_dict}"
                     )
             return items[:max_items]
         else:
-            local_logger.warning(f"Parsed JSON is not a list: {type(data)}")
+            local_logger.warning(
+                f"parse_json_list: Parsed JSON is not a list. Type: {type(data)}. Data: {str(data)[:200]}..."
+            )
             return []
     except json.JSONDecodeError as e:
         local_logger.error(
-            f"JSONDecodeError parsing text: {e}\nText was: {text[:500]}..."
+            f"parse_json_list: JSONDecodeError parsing text: {e}. Text snippet: {text[:500]}..."
         )
         return []
     except Exception as e:
         local_logger.error(
-            f"Unexpected error parsing JSON: {e}\nText was: {text[:500]}..."
+            f"parse_json_list: Unexpected error parsing JSON: {e}. Text snippet: {text[:500]}..."
         )
         return []
 
@@ -483,29 +504,68 @@ def run_task_with_review_and_refine(
                 )
                 crew.kickoff()
                 task_counter["count"] += 2
-                main_output = (
-                    getattr(task.output, "raw_output", "")
-                    if hasattr(task, "output")
-                    else ""
-                )
+                main_output = ""
+                parsed = []
+                if hasattr(task, "output") and task.output is not None:
+                    if (
+                        hasattr(task.output, "pydantic")
+                        and task.output.pydantic is not None
+                    ):
+                        logger.info(f"Using task.output.pydantic for '{name}'")
+                        if isinstance(task.output.pydantic, ItemListOutput):
+                            pydantic_model = task.output.pydantic
+                            parsed = [
+                                (item.name, item.description)
+                                for item in pydantic_model.items
+                            ]
+                            main_output = pydantic_model.model_dump_json(indent=2)
+                        else:
+                            logger.warning(
+                                f"task.output.pydantic for '{name}' is not of type ItemListOutput. Type: {type(task.output.pydantic)}. Falling back to raw."
+                            )
+                            main_output = getattr(task.output, "raw", "")
+                            parsed = parse_json_list(main_output, max_items)
+                    elif (
+                        hasattr(task.output, "raw")
+                        and task.output.raw
+                        and task.output.raw.strip()
+                    ):
+                        logger.info(
+                            f"Using task.output.raw for '{name}' as pydantic output was not available."
+                        )
+                        main_output = task.output.raw
+                        parsed = parse_json_list(main_output, max_items)
+                    else:
+                        logger.warning(
+                            f"No usable output (pydantic or raw) found for '{name}'. task.output attributes: {vars(task.output) if task.output else 'None'}"
+                        )
+                else:
+                    logger.warning(
+                        f"Task '{name}' has no output object or output is None."
+                    )
                 logger.debug(
-                    f"Attempting to parse main_output for '{name}' (cycle {cycle+1}, attempt {attempt+1}):\n'''{main_output}'''"
+                    f"Content used for parsing for '{name}':\n'''{main_output}'''"
                 )
+                logger.debug(f"Parsed items for '{name}': {parsed}")
                 review_output = (
                     getattr(review_task.output, "raw_output", "")
                     if hasattr(review_task, "output")
                     else ""
                 )
-                parsed = parse_fn(main_output, max_items)
-                if not parsed:
+                if not parsed and main_output.strip():
                     logger.warning(
-                        f"Parse failed for output in cycle {cycle+1}, attempt {attempt+1}. Retrying..."
+                        f"Parsing produced no items for list-producing task '{name}' in cycle {cycle+1}, attempt {attempt+1}. Output was: {main_output[:200]}. Retrying..."
                     )
                     if attempt == parse_retries - 1:
                         error = True
-                        error_msg = f"Parse failed after {parse_retries} attempts."
-                        break
-                    continue
+                        error_msg = f"Parse failed after {parse_retries} attempts for '{name}'. Output could not be parsed into expected items."
+                        logger.error(
+                            f"Final output from '{name}' that failed structured parsing or item extraction:\n'''{main_output}'''"
+                        )
+                elif not parsed and not main_output.strip():
+                    logger.warning(
+                        f"No output produced by agent for list-producing task '{name}' in cycle {cycle+1}, attempt {attempt+1}."
+                    )
                 current_output = main_output
                 current_review = review_output
                 outputs.append(
@@ -708,7 +768,7 @@ def orchestrate_full_workflow(
     # Architect-level refinement
     json_output_instruction = (
         "Output MUST be a JSON array of objects, each with 'name' and 'description' fields, "
-        "e.g. [{'name': 'ModuleName', 'description': 'Purpose of the module'}, ...] (no extra text)."
+        "e.g. [{'name': 'ModuleName', 'description': 'Purpose of the module'}, ...] (no extra text, no explanation)."
     )
     architect_create_refine_fn = lambda ctf, n, d, oo, ro, cyc: create_refinement_task(
         ctf, n, d, oo, ro, cyc, json_output_instruction
@@ -740,29 +800,46 @@ def orchestrate_full_workflow(
             "error_msg": arch_outputs["error_msg"],
         }
     modules = parse_json_list(arch_outputs["final_output"], max_items, logger=logger)
+    if not modules and arch_outputs["final_output"]:
+        logger.error(
+            "Architecture parsing resulted in no modules. Halting module processing."
+        )
+        return {
+            "architecture": arch_outputs["final_output"],
+            "architecture_review": arch_outputs["final_review"],
+            "architecture_cycles": arch_outputs["cycles"],
+            "modules": [],
+            "error": True,
+            "error_msg": "Failed to parse modules from architect's JSON output.",
+        }
     numbered_list_instruction = "Output in the required format: Each item MUST be in the format '1. Name: Description' (one per line, no extra text)."
     default_create_refine_fn = lambda ctf, n, d, oo, ro, cyc: create_refinement_task(
         ctf, n, d, oo, ro, cyc, numbered_list_instruction
     )
+    json_aware_create_refine_fn = architect_create_refine_fn
+    function_code_instruction = "Provide the full code implementation with a docstring, ensuring it meets the original requirements and addresses the review feedback."
+    function_create_refine_fn = lambda ctf, n, d, oo, ro, cyc: create_refinement_task(
+        ctf, n, d, oo, ro, cyc, function_code_instruction
+    )
     next_function_level = make_next_level_handler(
         create_function_manager_task,
         create_function_review_task,
-        default_create_refine_fn,
+        function_create_refine_fn,
         lambda x, _: [],
         None,
     )
     next_class_level = make_next_level_handler(
         create_class_manager_task,
         create_class_review_task,
-        default_create_refine_fn,
-        parse_json_list,
+        json_aware_create_refine_fn,
+        lambda text, max_items_arg: parse_json_list(text, max_items_arg, logger=logger),
         next_function_level,
     )
     next_module_level = make_next_level_handler(
         create_module_manager_task,
         create_module_review_task,
-        default_create_refine_fn,
-        parse_json_list,
+        json_aware_create_refine_fn,
+        lambda text, max_items_arg: parse_json_list(text, max_items_arg, logger=logger),
         next_class_level,
     )
     modules_result = next_module_level(

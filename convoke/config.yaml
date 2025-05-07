@@ -1,0 +1,18 @@
+# config.yaml - Default project configuration for Convoke
+
+# Model settings
+design_model: gpt-4o
+function_model: gpt-3.5-turbo
+
+# Orchestration parameters
+max_depth: 4
+max_items: 5
+max_tasks: 100
+
+# Review & retry settings
+review_cycles: 1
+parse_retries: 1
+
+# Placeholder for project-specific requirements
+requirements: |
+  TODO: Insert project-specific requirements here

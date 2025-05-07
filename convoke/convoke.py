@@ -29,6 +29,9 @@ import json
 from typing import List, Tuple, Dict, Any, Optional, Callable
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field, RootModel
+import yaml
+from convoke.store import FileSystemArtifactStore
+from convoke.tools import ScopedGetArtifactTool, ScopedSaveArtifactTool
 
 load_dotenv()
 
@@ -790,6 +793,9 @@ def orchestrate_full_workflow(
     review_cycles: int = 1,
     parse_retries: int = 1,
     output_dir: str = "output",
+    artifact_store: Optional[FileSystemArtifactStore] = None,
+    get_tool: Optional[ScopedGetArtifactTool] = None,
+    save_tool: Optional[ScopedSaveArtifactTool] = None,
 ) -> Dict[str, Any]:
     """Orchestrate the full hierarchical workflow with peer review at each level.
 
@@ -803,9 +809,18 @@ def orchestrate_full_workflow(
         review_cycles (int): Number of review/refinement cycles per task.
         parse_retries (int): Number of times to retry a task if output parsing fails.
         output_dir (str): Directory to save the outputs.
+        artifact_store (FileSystemArtifactStore, optional): Artifact store instance.
     Returns:
         Dict[str, Any]: Nested results for all levels.
     """
+    # Use provided scoped tools or fall back to direct store
+    reader = get_tool or ScopedGetArtifactTool(
+        store=artifact_store, agent_role="System", allowed_read_prefixes=[""]
+    )
+    writer = save_tool or ScopedSaveArtifactTool(
+        store=artifact_store, agent_role="System", allowed_write_prefixes=[""]
+    )
+
     logger = logger or logging.getLogger(__name__)
     task_counter["count"] = 0
     # Architect-level refinement
@@ -855,6 +870,14 @@ def orchestrate_full_workflow(
             "error": True,
             "error_msg": "Failed to parse modules from architect's JSON output.",
         }
+    # Ensure parsed architecture JSON dict for saving
+    try:
+        arch_dict = json.loads(arch_outputs["final_output"])
+    except Exception:
+        arch_dict = {}
+        logger.warning(
+            "Failed to parse architecture JSON for arch_dict; using empty dict."
+        )
     numbered_list_instruction = "Output in the required format: Each item MUST be in the format '1. Name: Description' (one per line, no extra text)."
     default_create_refine_fn = lambda ctf, n, d, oo, ro, cyc: create_refinement_task(
         ctf, n, d, oo, ro, cyc, numbered_list_instruction
@@ -896,70 +919,66 @@ def orchestrate_full_workflow(
         review_cycles,
         parse_retries,
     )
-    # Save architecture design and review
-    ensure_dir_exists(output_dir)
-    write_json_file(
-        os.path.join(output_dir, "architecture.json"),
-        json.loads(arch_outputs["final_output"]),
-    )
-    write_text_file(
-        os.path.join(output_dir, "architecture_review.txt"),
-        arch_outputs["final_review"] or "",
-    )
+    # Instantiate store
+    store = artifact_store  # passed in from main, or create new if None
+
+    # Save architecture via scoped writer
+    writer._run("architecture.json", json.dumps(arch_dict, indent=2), True)
+    writer._run("architecture_review.txt", arch_outputs["final_review"] or "", False)
 
     def save_module_tree(modules, parent_dir):
         for mod in modules:
-            mod_dir = os.path.join(parent_dir, mod["name"].replace(" ", "_"))
-            ensure_dir_exists(mod_dir)
+            mod_rel = f"modules/{mod['name'].replace(' ', '_')}/"
             # Save module design and review
-            write_json_file(
-                os.path.join(mod_dir, "module_design.json"),
-                {
-                    "name": mod["name"],
-                    "description": mod["description"],
-                    "cycles": mod["cycles"],
-                    "final_output": mod["final_output"],
-                },
-            )
-            write_text_file(
-                os.path.join(mod_dir, "module_review.txt"), mod["final_review"] or ""
-            )
-            for cls in mod.get("children", []):
-                cls_dir = os.path.join(mod_dir, cls["name"].replace(" ", "_"))
-                ensure_dir_exists(cls_dir)
-                # Save class design and review
-                write_json_file(
-                    os.path.join(cls_dir, "class_design.json"),
+            writer._run(
+                mod_rel + "module_design.json",
+                json.dumps(
                     {
-                        "name": cls["name"],
-                        "description": cls["description"],
-                        "cycles": cls["cycles"],
-                        "final_output": cls["final_output"],
+                        "name": mod["name"],
+                        "description": mod["description"],
+                        "cycles": mod["cycles"],
+                        "final_output": mod["final_output"],
                     },
+                    indent=2,
+                ),
+                True,
+            )
+            writer._run(mod_rel + "module_review.txt", mod["final_review"] or "", False)
+            for cls in mod.get("children", []):
+                cls_rel = mod_rel + f"{cls['name'].replace(' ', '_')}/"
+                # Save class design and review
+                writer._run(
+                    cls_rel + "class_design.json",
+                    json.dumps(
+                        {
+                            "name": cls["name"],
+                            "description": cls["description"],
+                            "cycles": cls["cycles"],
+                            "final_output": cls["final_output"],
+                        },
+                        indent=2,
+                    ),
+                    True,
                 )
-                write_text_file(
-                    os.path.join(cls_dir, "class_review.txt"), cls["final_review"] or ""
+                writer._run(
+                    cls_rel + "class_review.txt", cls["final_review"] or "", False
                 )
                 for fn in cls.get("children", []):
                     # Save function code and review
-                    fn_file = os.path.join(
-                        cls_dir, f"{fn['name'].replace(' ', '_')}.py"
-                    )
-                    write_text_file(fn_file, fn["final_output"] or "")
-                    write_text_file(
-                        os.path.join(
-                            cls_dir, f"{fn['name'].replace(' ', '_')}_review.txt"
-                        ),
+                    fn_file = cls_rel + f"{fn['name'].replace(' ', '_')}.py"
+                    writer._run(fn_file, fn["final_output"] or "", False)
+                    writer._run(
+                        cls_rel + f"{fn['name'].replace(' ', '_')}_review.txt",
                         fn["final_review"] or "",
+                        False,
                     )
                     # Lint the function code and save lint results
                     if fn["final_output"]:
                         lint_result = lint_python_code(fn["final_output"])
-                        write_text_file(
-                            os.path.join(
-                                cls_dir, f"{fn['name'].replace(' ', '_')}_lint.txt"
-                            ),
+                        writer._run(
+                            cls_rel + f"{fn['name'].replace(' ', '_')}_lint.txt",
                             lint_result,
+                            False,
                         )
                         # Generate and review unit test
                         test_task = create_test_developer_task(
@@ -976,16 +995,12 @@ def orchestrate_full_workflow(
                         test_code = getattr(test_task.output, "raw", "")
                         test_review = getattr(test_review_task.output, "raw", "")
                         # Save test code and review
-                        test_file = os.path.join(
-                            cls_dir, f"test_{fn['name'].replace(' ', '_')}.py"
-                        )
-                        write_text_file(test_file, test_code)
-                        write_text_file(
-                            os.path.join(
-                                cls_dir,
-                                f"test_{fn['name'].replace(' ', '_')}_review.txt",
-                            ),
+                        test_file = cls_rel + f"test_{fn['name'].replace(' ', '_')}.py"
+                        writer._run(test_file, test_code, False)
+                        writer._run(
+                            cls_rel + f"test_{fn['name'].replace(' ', '_')}_review.txt",
                             test_review,
+                            False,
                         )
 
     save_module_tree(modules_result, output_dir)
@@ -1105,10 +1120,16 @@ def main():
         description="Hierarchical CrewAI programming team orchestrator."
     )
     parser.add_argument(
+        "--project-path",
+        type=str,
+        required=True,
+        help="Path to the project directory (contains config.yaml, output/ folder).",
+    )
+    parser.add_argument(
         "--requirements",
         type=str,
         required=False,
-        help="High-level requirements for the system. (Default: a todo-list app)",
+        help="High-level requirements for the system. (Ignored if project config specifies requirements)",
     )
     parser.add_argument(
         "--max-depth", type=int, default=4, help="Maximum recursion depth (default: 4)"
@@ -1141,13 +1162,41 @@ def main():
         help="Number of times to retry a task if output parsing fails (default: 1)",
     )
     args = parser.parse_args()
-    ensure_api_keys()
-    requirements = args.requirements or (
-        "A command-line todo list application that allows users to add, remove, "
-        "list, and mark tasks as complete. Data should be persisted between runs."
+
+    project_path = args.project_path
+    # Load project-specific configuration
+    config_file = os.path.join(project_path, "config.yaml")
+    with open(config_file, "r", encoding="utf-8") as f:
+        config = yaml.safe_load(f)
+    # Override args with config values
+    requirements = (
+        args.requirements
+        or config.get("requirements")
+        or "A command-line todo list application that allows users to add, remove, list, and mark tasks as complete. Data should be persisted between runs."
     )
+    max_depth = config.get("max_depth", args.max_depth)
+    max_items = config.get("max_items", args.max_items)
+    max_tasks = config.get("max_tasks", args.max_tasks)
+    review_cycles = config.get("review_cycles", args.review_cycles)
+    parse_retries = config.get("parse_retries", args.parse_retries)
     if args.verbose > 0:
         logging.getLogger().setLevel(logging.DEBUG)
+    # Determine output directory and instantiate artifact store
+    output_dir = os.path.join(project_path, "output")
+    artifact_store = FileSystemArtifactStore(output_dir, logger)
+
+    # Create scoped artifact tools for system-level access
+    system_read_tool = ScopedGetArtifactTool(
+        store=artifact_store,
+        agent_role="System",
+        allowed_read_prefixes=[""],
+    )
+    system_write_tool = ScopedSaveArtifactTool(
+        store=artifact_store,
+        agent_role="System",
+        allowed_write_prefixes=[""],
+    )
+
     logger.info("Starting the Fully Automated Programming Crew...")
 
     def handle_interrupt(signum, frame):
@@ -1162,13 +1211,17 @@ def main():
     try:
         results = orchestrate_full_workflow(
             requirements,
-            max_depth=args.max_depth,
-            max_items=args.max_items,
-            max_tasks=args.max_tasks,
+            max_depth=max_depth,
+            max_items=max_items,
+            max_tasks=max_tasks,
             verbose=args.verbose,
             logger=logger,
-            review_cycles=args.review_cycles,
-            parse_retries=args.parse_retries,
+            review_cycles=review_cycles,
+            parse_retries=parse_retries,
+            output_dir=output_dir,
+            artifact_store=artifact_store,
+            get_tool=system_read_tool,
+            save_tool=system_write_tool,
         )
         if results.get("error"):
             logger.error(f"Workflow terminated due to error: {results['error_msg']}")

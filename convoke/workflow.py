@@ -1,11 +1,13 @@
 import logging
-from typing import List, Tuple, Dict, Any, Optional, Callable, Union
+from typing import List, Tuple, Dict, Any, Optional, Callable, Union, TypeVar, Type
+from pathlib import Path
 from crewai import Task, Crew, Process
-from convoke.agents import ItemListOutput
+from convoke.agents import ItemListOutput, check_agent_decision
 from convoke.utils import lint_python_code
 from convoke.store import FileSystemArtifactStore
 from convoke.tools import scoped_get_artifact, scoped_save_artifact
 import json
+import os
 from convoke.project import write_project_scaffolding, write_tree_visualization
 from convoke.agents import (
     create_architect_task,
@@ -19,15 +21,8 @@ from convoke.agents import (
     ItemListOutput,
 )
 from convoke.parsers import parse_json_list, extract_items_from_pydantic_output
-from convoke.project import write_project_scaffolding, write_tree_visualization
-import os
-from convoke.utils import (
-    ensure_dir_exists,
-    write_json_file,
-    write_text_file,
-    lint_python_code,
-)
-from convoke.agents import create_test_developer_task, create_test_review_task
+from convoke.events import get_event_bus, EventTypes
+import copy
 
 __all__ = [
     "parse_json_list",
@@ -40,390 +35,394 @@ task_counter = {"count": 0}
 
 
 def run_task_with_review(
-    main_task: Task,
-    review_task_fn: Callable[[Task], Task],
+    task: Dict[str, Any],
+    review_task: Dict[str, Any],
+    store: FileSystemArtifactStore,
+    output_dir: Path,
+    config: Dict[str, Any],
     logger: Optional[logging.Logger] = None,
     verbose: int = 0,
+    previous_task_outputs: Optional[List[Dict[str, Any]]] = None,
+    previous_level_outputs: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
+    """Run a task with a single review step.
+
+    Args:
+        task: The task definition
+        review_task: The review task definition
+        store: The artifact store
+        output_dir: The output directory
+        config: Configuration settings
+        logger: Optional logger
+        verbose: Verbosity level
+        previous_task_outputs: Outputs from previous tasks in the same level
+        previous_level_outputs: Outputs from previous levels
+
+    Returns:
+        Dictionary containing the task output and review
+    """
+    # Get event bus
+    event_bus = get_event_bus(logger)
+
+    task_name = task.get("name", "Unnamed Task")
+    review_name = review_task.get("name", "Review Task")
+
+    if verbose >= 1 and logger:
+        logger.info(f"Starting task with review: {task_name}")
+
+    # First run the main task
+    task_result = run_task(
+        task,
+        store,
+        output_dir,
+        config,
+        logger,
+        verbose,
+        previous_task_outputs,
+        previous_level_outputs,
+    )
+
+    if task_result["error"]:
+        return {
+            "error": True,
+            "error_msg": task_result["error_msg"],
+            "output": None,
+            "review": None,
+            "output_path": None,
+            "review_path": None,
+        }
+
+    # Add task output to review task context
+    review_task_copy = copy.deepcopy(review_task)
+    if "context" not in review_task_copy:
+        review_task_copy["context"] = []
+
+    # Add the task output to the review context
+    review_task_copy["context"].append(
+        {
+            "role": "user",
+            "content": f"Review the following output:\n\n{task_result['output']}",
+        }
+    )
+
+    # Execute the review task
+    if verbose >= 1 and logger:
+        logger.info(f"Starting review task: {review_name}")
+
+    # Emit review task started event
+    event_bus.publish(
+        EventTypes.TASK_STARTED,
+        task_name=review_name,
+        task_type="review",
+    )
+
     try:
-        review_task = review_task_fn(main_task)
-        main_agent = main_task.agent
-        review_agent = review_task.agent
-        if (main_agent is None) or (review_agent is None):
-            error_msg = "Main task or review task is missing an agent."
+        # Create the review task object
+        review_task_obj = Task(
+            description=review_task_copy.get("description", ""),
+            expected_output=review_task_copy.get("expected_output", ""),
+            agent=review_task_copy.get("agent"),
+            context=review_task_copy.get("context", []),
+        )
+
+        # Get the agent
+        agent = review_task_obj.agent
+
+        if agent is None:
+            error_msg = f"Review task {review_name} missing agent"
             if logger:
                 logger.error(error_msg)
             return {
-                "main": "",
-                "review": f"ERROR: {error_msg}",
                 "error": True,
                 "error_msg": error_msg,
+                "output": task_result["output"],
+                "review": None,
+                "output_path": task_result["output_path"],
+                "review_path": None,
             }
-        crew = Crew(
-            agents=[main_agent, review_agent],
-            tasks=[main_task, review_task],
-            process=Process.sequential,
-            verbose=bool(verbose),
+
+        # Execute the review task
+        review_output = agent.execute_task(review_task_obj)
+        task_counter["count"] += 1
+
+        # Save the review output if we have a store
+        review_path = None
+        if store:
+            review_path = f"{review_name.replace(' ', '_')}.txt"
+            store.save_artifact(review_path, review_output)
+
+        # Emit review task completed event
+        event_bus.publish(
+            EventTypes.TASK_COMPLETED,
+            task_name=review_name,
+            task_type="review",
+            output_path=review_path,
         )
-        crew.kickoff()
-        task_counter["count"] += 2
+
         return {
-            "main": (
-                getattr(main_task.output, "raw_output", "")
-                if hasattr(main_task, "output")
-                else ""
-            ),
-            "review": (
-                getattr(review_task.output, "raw_output", "")
-                if hasattr(review_task, "output")
-                else ""
-            ),
             "error": False,
             "error_msg": None,
+            "output": task_result["output"],
+            "review": review_output,
+            "output_path": task_result["output_path"],
+            "review_path": review_path,
         }
     except Exception as e:
+        error_msg = f"Review task execution failed: {str(e)}"
         if logger:
-            logger.error(f"Task or review failed: {e}")
-        return {"main": "", "review": f"ERROR: {e}", "error": True, "error_msg": str(e)}
+            logger.error(error_msg)
 
-
-def orchestrate_level(
-    items: List[Tuple[str, str]],
-    create_task_fn: Callable[[str, str, Optional[List[Any]]], Task],
-    create_review_fn: Callable[[Task], Task],
-    create_refine_fn: Callable[
-        [Callable[[str, str, Optional[List[Any]]], Task], str, str, str, str, int], Task
-    ],
-    parse_fn: Callable[[str, int], List[Tuple[str, str]]],
-    next_level_fn_or_depth: Optional[Union[Callable[..., List[Dict[str, Any]]], int]],
-    max_depth: int,
-    max_items: int,
-    logger: logging.Logger,
-    max_tasks: int,
-    verbose: int,
-    review_cycles: int,
-    parse_retries: int,
-    artifact_store: Optional[FileSystemArtifactStore] = None,
-    current_scope_path: str = "",
-) -> List[Dict[str, Any]]:
-    # Handle both legacy usage and new usage
-    recursion_depth = 0
-    next_level_fn = None
-    if isinstance(next_level_fn_or_depth, int):
-        recursion_depth = next_level_fn_or_depth
-    else:
-        recursion_depth = 0  # Default if not provided
-        next_level_fn = next_level_fn_or_depth
-
-    if recursion_depth > max_depth:
-        logger.warning(
-            f"Recursion depth {recursion_depth} exceeds max {max_depth}. Aborting deeper recursion."
-        )
-        return []
-
-    # Ensure we have a valid artifact store
-    if artifact_store is None:
-        logger.warning(
-            "No artifact store provided to orchestrate_level, creating default store"
-        )
-        artifact_store = FileSystemArtifactStore(
-            base_path="./artifacts", logger=logger, agent_role="orchestrator"
+        # Emit review task error event
+        event_bus.publish(
+            EventTypes.TASK_ERROR,
+            error_msg=error_msg,
+            task_name=review_name,
+            exception=e,
         )
 
-    results = []
-    for name, desc in items[:max_items]:
-        if task_counter["count"] >= max_tasks:
-            logger.warning(f"Task cap reached ({max_tasks}). Halting further spawning.")
-            break
-
-        # Compute scope for this item
-        item_full_scope_path = os.path.join(current_scope_path, name.replace(" ", "_"))
-
-        # Determine role (optional: infer from create_task_fn or pass as param)
-        role = getattr(create_task_fn, "role", "Agent")
-
-        # Create a scoped child store for this item
-        item_store = artifact_store.create_child_store(
-            scope_path=item_full_scope_path, agent_role=role
-        )
-
-        # Create tools that use the scoped store
-        tools = [
-            scoped_save_artifact,
-            scoped_get_artifact,
-        ]
-
-        # Pass tools to agent creation for both main and review tasks
-        outputs = run_task_with_review_and_refine(
-            name,
-            desc,
-            lambda n, d: create_task_fn(n, d, tools),
-            lambda t: create_review_fn(t),
-            lambda ctf, n, d, oo, ro, cyc: create_refinement_task(
-                ctf,
-                n,
-                d,
-                oo,
-                ro,
-                cyc,
-                "Output MUST be a JSON array of objects with 'name' and 'description'.",
-            ),
-            parse_fn,
-            logger,
-            verbose,
-            review_cycles,
-            parse_retries,
-            max_items,
-            scoped_store=item_store,  # Pass the scoped store to run_task_with_review_and_refine
-        )
-
-        if outputs.get("error"):
-            logger.error(f"Critical error in task '{name}': {outputs['error_msg']}")
-            results.append(
-                {
-                    "name": name,
-                    "description": desc,
-                    # 'cycles' may be missing in test patches
-                    "cycles": outputs.get("cycles", []),
-                    "final_output": outputs.get("final_output"),
-                    "final_review": outputs.get("final_review"),
-                    "children": [],
-                    "error": True,
-                    "error_msg": outputs.get("error_msg"),
-                }
-            )
-            break
-
-        # Use parsed_list directly (do not re-parse)
-        next_items = outputs.get("parsed_list", [])
-        next_results = []
-
-        if next_level_fn:
-            next_results = next_level_fn(
-                next_items,
-                recursion_depth=recursion_depth + 1,
-                logger=logger,
-                max_depth=max_depth,
-                max_items=max_items,
-                max_tasks=max_tasks,
-                verbose=verbose,
-                review_cycles=review_cycles,
-                parse_retries=parse_retries,
-                artifact_store=item_store,  # Pass the item's store to the next level
-                current_scope_path=item_full_scope_path,
-            )
-
-        results.append(
-            {
-                "name": name,
-                "description": desc,
-                "cycles": outputs.get("cycles", []),
-                "final_output": outputs.get("final_output"),
-                "final_review": outputs.get("final_review"),
-                "children": next_results,
-                "error": False,
-                "error_msg": None,
-            }
-        )
-
-    return results
+        return {
+            "error": True,
+            "error_msg": error_msg,
+            "output": task_result["output"],
+            "review": None,
+            "output_path": task_result["output_path"],
+            "review_path": None,
+        }
 
 
 def run_task_with_review_and_refine(
-    name: str,
-    desc: str,
-    create_task_fn: Callable[[str, str], Task],
-    create_review_fn: Callable[[Task], Task],
-    create_refine_fn: Callable[
-        [Callable[[str, str], Task], str, str, str, str, int], Task
-    ],
-    parse_fn: Callable[[str, int], List[Tuple[str, str]]],
-    logger: logging.Logger,
-    verbose: int,
-    review_cycles: int,
-    parse_retries: int,
-    max_items: int,
-    scoped_store: Optional[FileSystemArtifactStore] = None,
+    task: Dict[str, Any],
+    store: FileSystemArtifactStore,
+    output_dir: Path,
+    config: Dict[str, Any],
+    logger: Optional[logging.Logger] = None,
+    verbose: int = 0,
+    previous_task_outputs: Optional[List[Dict[str, Any]]] = None,
+    previous_level_outputs: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
-    outputs = []
-    current_output = None
-    current_review = None
-    error = False
-    error_msg = None
+    """Run a task with review and refinement cycles."""
+    event_bus = get_event_bus(logger)
+    task_name = task.get("name", "Unnamed Task")
+    task_desc = task.get("description", "")
+    review_cycles = task.get("refine", {}).get("cycles", 3)
+    parse_retries = task.get("refine", {}).get("parse_retries", 3)
+    max_items = task.get("refine", {}).get("max_items", 10)
+    parse_fn = task.get("refine", {}).get("parse_fn")
+    if parse_fn is None:
+        from convoke.parsers import parse_json_list
 
-    for cycle in range(review_cycles):
-        if cycle == 0:
-            # Pass tool_params to the task creation function
-            task = create_task_fn(name, desc)
+        parse_fn = parse_json_list
 
-            # Attach store to the agent's tools if needed
-            if (
-                scoped_store
-                and hasattr(task, "agent")
-                and task.agent
-                and hasattr(task.agent, "tools")
-            ):
-                for tool in task.agent.tools:
-                    # Set the store parameter in the tool's parameters directly
-                    if hasattr(tool, "params"):
-                        tool.params["store"] = scoped_store
-        else:
-            task = create_refine_fn(
-                create_task_fn,
-                name,
-                desc,
-                current_output if current_output is not None else "",
-                current_review if current_review is not None else "",
-                cycle,
-                "Output MUST be a JSON array of objects with 'name' and 'description'.",
+    if verbose >= 1 and logger:
+        logger.info(f"Starting task with review and refinement: {task_name}")
+
+    event_bus.publish(
+        EventTypes.TASK_STARTED,
+        task_name=task_name,
+        task_type="review_and_refine",
+    )
+
+    try:
+        # Create the main task object
+        task_obj = Task(
+            description=task_desc,
+            expected_output=task.get("expected_output", ""),
+            agent=task.get("agent"),
+            context=task.get("context", []),
+        )
+        main_agent = task_obj.agent
+        if main_agent is None:
+            error_msg = f"Task {task_name} missing agent"
+            if logger:
+                logger.error(error_msg)
+            return {
+                "error": True,
+                "error_msg": error_msg,
+                "parsed_list": [],
+                "cycles": [],
+                "final_output": "",
+                "final_review": "",
+            }
+        if verbose >= 2 and logger:
+            logger.info(f"Executing main task: {task_name}")
+        main_output = main_agent.execute_task(task_obj)
+        task_counter["count"] += 1
+        if store:
+            store.save_artifact(f"{task_name.replace(' ', '_')}.json", main_output)
+        # Create the review task
+        review_task_def = task.get("review", {})
+        review_task_obj = Task(
+            description=review_task_def.get("description", f"Review for {task_name}"),
+            expected_output=review_task_def.get("expected_output", ""),
+            agent=review_task_def.get("agent"),
+            context=review_task_def.get("context", []) + [task_obj],
+        )
+        review_agent = review_task_obj.agent
+        if review_agent is None:
+            error_msg = f"Review task for {task_name} missing agent"
+            if logger:
+                logger.error(error_msg)
+            return {
+                "error": True,
+                "error_msg": error_msg,
+                "parsed_list": [],
+                "cycles": [],
+                "final_output": main_output,
+                "final_review": "",
+            }
+        if verbose >= 2 and logger:
+            logger.info(f"Executing review for: {task_name}")
+        review_output = review_agent.execute_task(review_task_obj)
+        task_counter["count"] += 1
+        if store:
+            store.save_artifact(
+                f"{task_name.replace(' ', '_')}_review.txt", review_output
             )
-
-            # Attach store to the agent's tools if needed
-            if (
-                scoped_store
-                and hasattr(task, "agent")
-                and task.agent
-                and hasattr(task.agent, "tools")
-            ):
-                for tool in task.agent.tools:
-                    # Set the store parameter in the tool's parameters directly
-                    if hasattr(tool, "params"):
-                        tool.params["store"] = scoped_store
-
-        # Also modify the review task to include the store
-        review_task = create_review_fn(task)
-        if (
-            scoped_store
-            and hasattr(review_task, "agent")
-            and review_task.agent
-            and hasattr(review_task.agent, "tools")
-        ):
-            for tool in review_task.agent.tools:
-                if hasattr(tool, "params"):
-                    tool.params["store"] = scoped_store
-
-        for attempt in range(parse_retries):
-            try:
-                review_task = create_review_fn(task)
-                agents = [
-                    agent
-                    for agent in [task.agent, review_task.agent]
-                    if agent is not None
-                ]
-                if len(agents) != 2:
-                    raise ValueError(
-                        "Both task.agent and review_task.agent must be non-None."
+        # Parse the initial output
+        parsed_items = []
+        parse_success = False
+        parse_attempt = 0
+        while parse_attempt < parse_retries and not parse_success:
+            parse_attempt += 1
+            parsed_items = parse_fn(main_output, max_items)
+            parse_success = len(parsed_items) > 0
+            if parse_success:
+                if verbose >= 2 and logger:
+                    logger.info(
+                        f"Successfully parsed {len(parsed_items)} items from output"
                     )
-                crew = Crew(
-                    agents=agents,
-                    tasks=[task, review_task],
-                    process=Process.sequential,
-                    verbose=bool(verbose),
+                break
+            elif parse_attempt < parse_retries:
+                if logger:
+                    logger.warning(
+                        f"Parse attempt {parse_attempt} failed, trying again..."
+                    )
+        cycles = [
+            {
+                "cycle": 0,
+                "output": main_output,
+                "review": review_output,
+                "parsed_items_count": len(parsed_items),
+            }
+        ]
+        current_output = main_output
+        current_review = review_output
+        for cycle in range(1, review_cycles + 1):
+            if parse_success or cycle >= review_cycles:
+                break
+            if verbose >= 1 and logger:
+                logger.info(f"Starting refinement cycle {cycle} for {task_name}")
+            # Create refinement task
+            refine_task_def = task.get("refine", {})
+            refine_task_obj = Task(
+                description=(
+                    f"Refine your previous output for '{task_name}'.\n"
+                    f"Original description: {task_desc}\n"
+                    f"Your previous output:\n{current_output}\n"
+                    f"Peer review feedback:\n{current_review}\n"
+                    f"This is refinement cycle {cycle}. Please address the review feedback. "
+                    f"Output MUST be a JSON array of objects with 'name' and 'description'."
+                ),
+                expected_output="A revised output in the specified format.",
+                agent=refine_task_def.get("agent", main_agent),
+                context=[task_obj],
+            )
+            refine_agent = refine_task_obj.agent
+            if refine_agent is None:
+                error_msg = (
+                    f"Refinement task for {task_name} cycle {cycle} missing agent"
                 )
-                crew.kickoff()
-                task_counter["count"] += 2
-                main_output = ""
-                parsed = []
-                if hasattr(task, "output") and task.output is not None:
-                    if (
-                        hasattr(task.output, "pydantic")
-                        and task.output.pydantic is not None
-                        and isinstance(task.output.pydantic, ItemListOutput)
-                    ):
+                if logger:
+                    logger.error(error_msg)
+                break
+            refined_output = refine_agent.execute_task(refine_task_obj)
+            task_counter["count"] += 1
+            if store:
+                store.save_artifact(
+                    f"{task_name.replace(' ', '_')}_refined_{cycle}.json",
+                    refined_output,
+                )
+            # Parse the refined output
+            parse_success = False
+            parse_attempt = 0
+            while parse_attempt < parse_retries and not parse_success:
+                parse_attempt += 1
+                parsed_items = parse_fn(refined_output, max_items)
+                parse_success = len(parsed_items) > 0
+                if parse_success:
+                    if verbose >= 2 and logger:
                         logger.info(
-                            f"Using task.output.pydantic for '{name}' (ItemListOutput)"
+                            f"Successfully parsed {len(parsed_items)} items from refined output"
                         )
-                        pydantic_model = task.output.pydantic
-                        parsed = [
-                            (item.name, item.description)
-                            for item in pydantic_model.items
-                        ]
-                        main_output = pydantic_model.model_dump_json(indent=2)
-                    elif (
-                        hasattr(task.output, "raw")
-                        and task.output.raw
-                        and task.output.raw.strip()
-                    ):
+                    break
+                elif parse_attempt < parse_retries:
+                    if logger:
                         logger.warning(
-                            f"Falling back to raw output for '{name}' (pydantic output not available or wrong type)"
+                            f"Parse attempt {parse_attempt} for refinement failed, trying again..."
                         )
-                        main_output = task.output.raw
-                        parsed = parse_json_list(main_output, max_items)
-                    else:
-                        logger.warning(
-                            f"No usable output (pydantic or raw) found for '{name}'. task.output attributes: {vars(task.output) if task.output else 'None'}"
-                        )
-                else:
-                    logger.warning(
-                        f"Task '{name}' has no output object or output is None."
-                    )
-                logger.debug(
-                    f"Content used for parsing for '{name}':\n'''{main_output}'''"
+            # Get a review of the refined output
+            review_task_obj.context = [refine_task_obj]
+            refined_review = review_agent.execute_task(review_task_obj)
+            task_counter["count"] += 1
+            if store:
+                store.save_artifact(
+                    f"{task_name.replace(' ', '_')}_refined_review_{cycle}.txt",
+                    refined_review,
                 )
-                logger.debug(f"Parsed items for '{name}': {parsed}")
-                review_output = (
-                    getattr(review_task.output, "raw", "")
-                    if hasattr(review_task, "output")
-                    else ""
-                )
-                if not parsed and main_output.strip():
-                    # If output is a JSON list (possibly empty), accept it without error
-                    stripped = main_output.strip()
-                    if not (stripped.startswith("[") and stripped.endswith("]")):
-                        logger.warning(
-                            f"Parsing produced no items for list-producing task '{name}' in cycle {cycle+1}, attempt {attempt+1}. Output was: {main_output[:200]}. Retrying..."
-                        )
-                        if attempt == parse_retries - 1:
-                            error = True
-                            error_msg = f"Parse failed after {parse_retries} attempts for '{name}'. Output could not be parsed into expected items."
-                            logger.error(
-                                f"Final output from '{name}' that failed structured parsing or item extraction:\n'''{main_output}'''"
-                            )
-                elif not parsed and not main_output.strip():
-                    logger.warning(
-                        f"No output produced by agent for list-producing task '{name}' in cycle {cycle+1}, attempt {attempt+1}."
-                    )
-                current_output = main_output
-                current_review = review_output
-                outputs.append(
-                    {
-                        "cycle": cycle + 1,
-                        "main_output": main_output,
-                        "review": review_output,
-                        "parsed_list": parsed,
-                    }
-                )
+            current_output = refined_output
+            current_review = refined_review
+            cycles.append(
+                {
+                    "cycle": cycle,
+                    "output": refined_output,
+                    "review": refined_review,
+                    "parsed_items_count": len(parsed_items),
+                }
+            )
+            if parse_success:
                 break
-            except Exception as e:
-                logger.error(f"Task or review failed: {e}")
-                error = True
-                error_msg = str(e)
-                break
-        if error:
-            break
-    return {
-        "cycles": outputs,
-        "final_output": current_output,
-        "final_review": current_review,
-        "parsed_list": current_output and parsed or [],
-        "error": error,
-        "error_msg": error_msg,
-    }
+        return {
+            "error": False,
+            "error_msg": None,
+            "parsed_list": parsed_items,
+            "cycles": cycles,
+            "final_output": current_output,
+            "final_review": current_review,
+        }
+    except Exception as e:
+        error_msg = f"Task with review and refinement failed: {str(e)}"
+        if logger:
+            logger.error(error_msg)
+        event_bus.publish(
+            EventTypes.TASK_ERROR,
+            error_msg=error_msg,
+            task_name=task_name,
+            exception=e,
+        )
+        return {
+            "error": True,
+            "error_msg": error_msg,
+            "parsed_list": [],
+            "cycles": [],
+            "final_output": "",
+            "final_review": "",
+        }
 
 
 def create_refinement_task(
-    create_task_fn: Callable[[str, str], Task],
+    create_task_fn: Callable[[str, str, Optional[List[Any]]], Task],
     name: str,
     desc: str,
     original_output: str,
     review_output: str,
     cycle: int,
     output_format_instruction: str,
+    tools: Optional[List[Any]] = None,
 ) -> Task:
     """
     Create a refinement task that includes previous output, peer feedback, and output format instructions.
     """
-    base_task = create_task_fn(name, desc)
+    base_task = create_task_fn(name, desc, tools)
     return Task(
         description=(
             f"Refine your previous output for '{name}'.\n"
@@ -441,13 +440,23 @@ def create_refinement_task(
 
 # Updated `make_next_level_handler` to include `artifact_store` and `current_scope_path` in the handler's signature and logic.
 def make_next_level_handler(
-    create_task_fn: Callable[[str, str, Optional[List[Any]]], Task],
-    create_review_fn: Callable[[Task], Task],
+    create_task_fn: Callable[[str, str, Optional[List[Any]], Optional[str]], Any],
+    create_review_fn: Callable[[Any], Any],
     create_refine_fn: Callable[
-        [Callable[[str, str, Optional[List[Any]]], Task], str, str, str, str, int], Task
+        [
+            Callable[[str, str, Optional[List[Any]], Optional[str]], Any],
+            str,
+            str,
+            str,
+            str,
+            int,
+            str,
+            Optional[List[Any]],
+        ],
+        Any,
     ],
     parse_fn: Callable[[str, int], List[Tuple[str, str]]],
-    next_level_fn: Optional[Callable],
+    next_level_fn: Optional[Callable[..., List[Dict[str, Any]]]],
 ) -> Callable[..., List[Dict[str, Any]]]:
     def handler(
         items: List[Tuple[str, str]],
@@ -510,51 +519,29 @@ def make_next_level_handler(
 
             # Pass tools to agent creation for both main and review tasks
             # If this is a function handler and we know the parent class name, pass it
-            task_creator = lambda n, d: create_task_fn(n, d, tools)
+            task_creator = lambda n, d, tools=tools: create_task_fn(n, d, tools)
 
             # Special handling for function manager to pass class_name
             if is_function_handler and parent_name:
-                task_creator = lambda n, d: create_task_fn(n, d, parent_name, tools)
+                task_creator = lambda n, d, tools=tools: create_task_fn(
+                    n, d, tools, parent_name
+                )
 
             # For function outputs, we use a different approach since they don't return JSON lists
             # Function managers are leaf nodes that produce Python code, not structured output
             if is_function_handler:
-                # Use run_task_with_review instead of run_task_with_review_and_refine
-                # since we don't need to parse or extract items from function outputs
-                outputs = run_task_with_review(
-                    task_creator(name, desc),
-                    lambda t: create_review_fn(t),
-                    logger=logger,
-                    verbose=verbose,
-                )
-
-                if outputs.get("error"):
-                    logger.error(
-                        f"Critical error in task '{name}': {outputs['error_msg']}"
-                    )
-                    results.append(
-                        {
-                            "name": name,
-                            "description": desc,
-                            "main_output": outputs.get("main", ""),
-                            "review": outputs.get("review", ""),
-                            "children": [],
-                            "error": True,
-                            "error_msg": outputs.get("error_msg"),
-                        }
-                    )
-                    continue
-
-                # Save code to output directory
+                # For function handlers, use agent.execute_task directly
+                task_obj = task_creator(name, desc)
+                review_obj = create_review_fn(task_obj)
+                main_output = task_obj.agent.execute_task(task_obj)
+                review_output = review_obj.agent.execute_task(review_obj)
+                # Save code and review as before
                 try:
-                    # Save the function's code to the output directory
-                    code_output = outputs.get("main", "")
+                    code_output = main_output
                     if code_output:
-                        # Save Python code to output directory
                         output_file_path = os.path.join(
                             current_scope_path, f"{name.replace(' ', '_')}.py"
                         )
-                        # Also save a JSON metadata file to the artifact store with a summary
                         function_metadata = {
                             "name": name,
                             "description": desc,
@@ -565,25 +552,19 @@ def make_next_level_handler(
                             f"{name}_metadata.json",
                             json.dumps(function_metadata, indent=2),
                         )
-
-                        # Save the actual code in the artifact store too for reference
                         item_store.save_artifact(f"{name}.py", code_output)
-
-                        # Also save the review as a separate file
-                        if outputs.get("review"):
+                        if review_output:
                             item_store.save_artifact(
-                                f"{name}_review.txt", outputs.get("review", "")
+                                f"{name}_review.txt", review_output
                             )
                 except Exception as e:
                     logger.error(f"Error saving function code: {e}")
-
-                # For function outputs, we don't have children items to process
                 results.append(
                     {
                         "name": name,
                         "description": desc,
-                        "main_output": outputs.get("main", ""),
-                        "review": outputs.get("review", ""),
+                        "main_output": main_output,
+                        "review": review_output,
                         "children": [],
                         "error": False,
                         "error_msg": None,
@@ -591,27 +572,14 @@ def make_next_level_handler(
                 )
             else:
                 # Normal processing for non-function outputs (JSON lists)
+                task_obj = task_creator(name, desc)
                 outputs = run_task_with_review_and_refine(
-                    name,
-                    desc,
-                    task_creator,
-                    lambda t: create_review_fn(t),
-                    lambda ctf, n, d, oo, ro, cyc: create_refinement_task(
-                        ctf,
-                        n,
-                        d,
-                        oo,
-                        ro,
-                        cyc,
-                        "Output MUST be a JSON array of objects with 'name' and 'description'.",
-                    ),
-                    parse_fn,
-                    logger,
-                    verbose,
-                    review_cycles,
-                    parse_retries,
-                    max_items,
-                    scoped_store=item_store,  # Pass the scoped store to the task
+                    task_obj,
+                    item_store,
+                    Path(current_scope_path),
+                    {},
+                    logger=logger,
+                    verbose=verbose,
                 )
 
                 if outputs.get("error"):
@@ -677,7 +645,7 @@ def make_next_level_handler_with_tools(
     orig_review_fn: Callable[..., Task],
     role: str,
     parse_fn: Callable[[str, int], List[Tuple[str, str]]],
-    next_level_fn: Optional[Callable],
+    next_level_fn: Optional[Callable[..., List[Dict[str, Any]]]],
 ) -> Callable[..., List[Dict[str, Any]]]:
     # This handler is now redundant since orchestrate_level handles tool injection.
     # Use the simpler make_next_level_handler instead.
@@ -690,185 +658,742 @@ def make_next_level_handler_with_tools(
     )
 
 
+def orchestrate_level(
+    level_def: Dict[str, Any],
+    store: FileSystemArtifactStore,
+    output_dir: Path,
+    config: Dict[str, Any],
+    logger: Optional[logging.Logger] = None,
+    verbose: int = 0,
+    previous_level_outputs: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """Orchestrate a single level of a workflow, including its tasks and reviews."""
+    # Get event bus
+    event_bus = get_event_bus(logger)
+
+    level_name = level_def.get("name", "Unnamed Level")
+
+    if verbose >= 1 and logger:
+        logger.info(f"Starting level orchestration: {level_name}")
+
+    task_outputs: List[Dict[str, Any]] = []
+    previous_level_outputs = previous_level_outputs or []
+
+    # Prepare tasks
+    tasks = level_def.get("tasks", [])
+
+    if not tasks:
+        error_msg = f"Level {level_name} has no tasks defined."
+        if logger:
+            logger.error(error_msg)
+
+        # Emit task error event
+        event_bus.publish(
+            EventTypes.LEVEL_ERROR,
+            error_msg=error_msg,
+            level_name=level_name,
+        )
+
+        return {
+            "error": True,
+            "error_msg": error_msg,
+            "tasks": [],
+        }
+
+    # Process each task in sequence
+    for task_num, task in enumerate(tasks, 1):
+        task_name = task.get("name", f"Task {task_num}")
+
+        if verbose >= 1 and logger:
+            logger.info(f"Starting task {task_num}: {task_name}")
+
+        # Emit task started event
+        event_bus.publish(
+            EventTypes.TASK_STARTED,
+            task_name=task_name,
+            task_num=task_num,
+            level_name=level_name,
+        )
+
+        try:
+            # Determine task execution function based on review and refine settings
+            if task.get("review", {}).get("enabled", False) and task.get(
+                "refine", {}
+            ).get("enabled", False):
+                task_output = run_task_with_review_and_refine(
+                    task,
+                    store,
+                    output_dir,
+                    config=config,
+                    logger=logger,
+                    verbose=verbose,
+                    previous_task_outputs=task_outputs,
+                    previous_level_outputs=previous_level_outputs,
+                )
+            elif task.get("review", {}).get("enabled", False):
+                review_task = task.get("review", {})
+                task_output = run_task_with_review(
+                    task,
+                    review_task,
+                    store,
+                    output_dir,
+                    config,
+                    logger,
+                    verbose,
+                    previous_task_outputs=task_outputs,
+                    previous_level_outputs=previous_level_outputs,
+                )
+            else:
+                task_output = run_task(
+                    task,
+                    store,
+                    output_dir,
+                    config,
+                    logger,
+                    verbose,
+                    previous_task_outputs=task_outputs,
+                    previous_level_outputs=previous_level_outputs,
+                )
+
+            task_outputs.append(task_output)
+
+            # Emit task completed event
+            event_bus.publish(
+                EventTypes.TASK_COMPLETED,
+                task_name=task_name,
+                task_num=task_num,
+                level_name=level_name,
+                output_path=task_output.get("output_path"),
+            )
+
+        except Exception as e:
+            error_msg = f"Task {task_name} failed: {str(e)}"
+            if logger:
+                logger.error(error_msg)
+
+            # Emit task error event
+            event_bus.publish(
+                EventTypes.TASK_ERROR,
+                error_msg=error_msg,
+                task_name=task_name,
+                task_num=task_num,
+                level_name=level_name,
+                exception=e,
+            )
+
+            task_outputs.append(
+                {
+                    "error": True,
+                    "error_msg": error_msg,
+                    "output": None,
+                    "output_path": None,
+                }
+            )
+
+            # Determine if we should continue or stop based on config
+            should_continue = config.get("continue_on_task_error", False)
+            if not should_continue:
+                # Emit level error event
+                event_bus.publish(
+                    EventTypes.LEVEL_ERROR,
+                    error_msg=f"Level stopped due to task error: {error_msg}",
+                    level_name=level_name,
+                )
+
+                return {
+                    "error": True,
+                    "error_msg": f"Level stopped due to task error: {error_msg}",
+                    "tasks": task_outputs,
+                }
+
+    return {
+        "error": False,
+        "error_msg": None,
+        "tasks": task_outputs,
+    }
+
+
 def orchestrate_full_workflow(
-    requirements: str,
-    max_depth: int,
-    max_items: int,
-    max_tasks: int,
-    verbose: int,
-    logger: logging.Logger,
-    review_cycles: int,
-    parse_retries: int,
-    output_dir: str,
-    artifact_store: FileSystemArtifactStore,
-    get_tool: Any,
-    save_tool: Any,
+    workflow_def: Dict[str, Any],
+    config: Dict[str, Any],
+    output_dir: Path,
+    logger: Optional[logging.Logger] = None,
+    verbose: int = 0,
+) -> Dict[str, Any]:
+    """Orchestrate a full workflow, including multiple levels with their tasks and reviews."""
+    # Get event bus
+    event_bus = get_event_bus(logger)
+
+    if "name" in workflow_def:
+        workflow_name = workflow_def["name"]
+    else:
+        workflow_name = "Full Workflow"
+
+    # Emit workflow started event
+    event_bus.publish(
+        EventTypes.WORKFLOW_STARTED,
+        workflow_name=workflow_name,
+        level_count=len(workflow_def.get("levels", [])),
+    )
+
+    try:
+        # Create store for artifacts
+        store_config = config.get("store", {})
+        store_instance = FileSystemArtifactStore(**store_config)
+
+        # Prepare workflow levels
+        levels = workflow_def.get("levels", [])
+
+        if not levels:
+            error_msg = "Workflow has no levels defined."
+            if logger:
+                logger.error(error_msg)
+
+            # Emit error event
+            event_bus.publish(
+                EventTypes.WORKFLOW_ERROR,
+                error_msg=error_msg,
+                workflow_name=workflow_name,
+            )
+
+            return {
+                "error": True,
+                "error_msg": error_msg,
+                "levels": [],
+            }
+
+        # Process each level in sequence
+        level_outputs: List[Dict[str, Any]] = []
+        for level_num, level in enumerate(levels, 1):
+            if verbose >= 1 and logger:
+                logger.info(
+                    f"Starting level {level_num}: {level.get('name', 'Unnamed Level')}"
+                )
+
+            # Emit level started event
+            event_bus.publish(
+                EventTypes.LEVEL_STARTED,
+                level_name=level.get("name", f"Level {level_num}"),
+                level_num=level_num,
+                workflow_name=workflow_name,
+            )
+
+            try:
+                level_output = orchestrate_level(
+                    level,
+                    store_instance,
+                    output_dir,
+                    config=config,
+                    logger=logger,
+                    verbose=verbose,
+                    previous_level_outputs=level_outputs if level_num > 1 else [],
+                )
+                level_outputs.append(level_output)
+
+                # Emit level completed event
+                event_bus.publish(
+                    EventTypes.LEVEL_COMPLETED,
+                    level_name=level.get("name", f"Level {level_num}"),
+                    level_num=level_num,
+                    workflow_name=workflow_name,
+                    task_count=len(level_output.get("tasks", [])),
+                )
+
+            except Exception as e:
+                error_msg = f"Level {level_num} failed: {str(e)}"
+                if logger:
+                    logger.error(error_msg)
+
+                # Emit error event
+                event_bus.publish(
+                    EventTypes.LEVEL_ERROR,
+                    error_msg=error_msg,
+                    level_name=level.get("name", f"Level {level_num}"),
+                    level_num=level_num,
+                    workflow_name=workflow_name,
+                    exception=e,
+                )
+
+                level_outputs.append(
+                    {
+                        "error": True,
+                        "error_msg": error_msg,
+                        "tasks": [],
+                    }
+                )
+
+                # Determine if we should continue or stop based on config
+                should_continue = config.get("continue_on_level_error", False)
+                if not should_continue:
+                    # Emit workflow error event
+                    event_bus.publish(
+                        EventTypes.WORKFLOW_ERROR,
+                        error_msg=f"Workflow stopped due to level error: {error_msg}",
+                        workflow_name=workflow_name,
+                        level_num=level_num,
+                    )
+
+                    return {
+                        "error": True,
+                        "error_msg": f"Workflow stopped due to level error: {error_msg}",
+                        "levels": level_outputs,
+                    }
+
+        # Emit workflow completed event
+        event_bus.publish(
+            EventTypes.WORKFLOW_COMPLETED,
+            workflow_name=workflow_name,
+            level_count=len(level_outputs),
+            success_count=sum(
+                1 for level in level_outputs if not level.get("error", False)
+            ),
+            error_count=sum(1 for level in level_outputs if level.get("error", False)),
+        )
+
+        # === Artifact saving (project scaffolding/tree) with error handling ===
+        try:
+            # Attempt to extract architecture and modules from outputs
+            architecture = None
+            modules = None
+            for level in level_outputs:
+                if not architecture and level.get("tasks"):
+                    for task in level["tasks"]:
+                        if task.get("final_output"):
+                            architecture = task["final_output"]
+                            break
+                if not modules and level.get("tasks"):
+                    for task in level["tasks"]:
+                        if task.get("parsed_list"):
+                            # Convert parsed_list to module dicts
+                            modules = [
+                                {"name": n, "description": d}
+                                for n, d in task["parsed_list"]
+                            ]
+                            break
+            if architecture is None:
+                architecture = ""
+            if modules is None:
+                modules = []
+            write_project_scaffolding(str(output_dir), architecture, modules)
+            write_tree_visualization(str(output_dir), modules)
+        except Exception as e:
+            error_msg = f"Artifact saving failed: {e}"
+            if logger:
+                logger.error(error_msg)
+            return {
+                "error": True,
+                "error_msg": error_msg,
+                "levels": level_outputs,
+            }
+
+        return {
+            "error": False,
+            "error_msg": None,
+            "levels": level_outputs,
+        }
+
+    except Exception as e:
+        error_msg = f"Workflow orchestration failed: {str(e)}"
+        if logger:
+            logger.error(error_msg)
+
+        # Emit workflow error event
+        event_bus.publish(
+            EventTypes.WORKFLOW_ERROR,
+            error_msg=error_msg,
+            workflow_name=workflow_name,
+            exception=e,
+        )
+
+        return {
+            "error": True,
+            "error_msg": error_msg,
+            "levels": [],
+        }
+
+
+def run_task_with_review_and_dynamic_refine(
+    main_task: Task,
+    review_task_fn: Callable[[Task], Task],
+    refine_task_fn: Callable[[Task, Task], Task],
+    max_iterations: int = 5,
+    logger: Optional[logging.Logger] = None,
+    verbose: int = 0,
 ) -> Dict[str, Any]:
     """
-    Main entry point for the full workflow orchestration. Coordinates all levels and writes outputs.
+    Run a task with review and refinement, where the agent can decide whether to continue iterating.
+    The agent can indicate its decision using: @agent Continue: "Yes/No question or statement"
+
+    Args:
+        main_task: The main task to execute
+        review_task_fn: Function to create a review task from the main task
+        refine_task_fn: Function to create a refinement task from the main and review tasks
+        max_iterations: Maximum number of iterations to perform
+        logger: Optional logger
+        verbose: Verbosity level
+
+    Returns:
+        Dictionary containing outputs from the tasks and iteration information
     """
-    logger = logger or logging.getLogger(__name__)
-    # Handle empty requirements: no architecture or modules
-    if not requirements or not requirements.strip():
+    try:
+        # Get event bus
+        event_bus = get_event_bus(logger)
+
+        # Emit workflow started event
+        event_bus.publish(
+            EventTypes.WORKFLOW_STARTED,
+            workflow_name=f"Task-Review-DynamicRefine Workflow for {getattr(main_task, 'name', 'Main Task')}",
+            max_iterations=max_iterations,
+        )
+
+        main_agent = main_task.agent
+        if main_agent is None:
+            error_msg = "Main task is missing an agent."
+            if logger:
+                logger.error(error_msg)
+
+            # Emit error event
+            event_bus.publish(
+                EventTypes.WORKFLOW_ERROR,
+                error_msg=error_msg,
+                workflow_name=f"Task-Review-DynamicRefine Workflow for {getattr(main_task, 'name', 'Main Task')}",
+            )
+
+            return {
+                "main": "",
+                "review": f"ERROR: {error_msg}",
+                "iterations": 0,
+                "error": True,
+                "error_msg": error_msg,
+            }
+
+        # Run initial task
+        # Emit task started event
+        event_bus.publish(
+            EventTypes.TASK_STARTED,
+            task_name=getattr(main_task, "name", "Main Task"),
+            agent_name=getattr(main_agent, "name", "Main Agent"),
+        )
+
+        main_output = main_agent.execute_task(main_task)
+        task_counter["count"] += 1
+
+        # Emit task completed event
+        event_bus.publish(
+            EventTypes.TASK_COMPLETED,
+            task_name=getattr(main_task, "name", "Main Task"),
+            task_type="main",
+            output_summary=(
+                main_output[:100] + "..." if len(main_output) > 100 else main_output
+            ),
+        )
+
+        review_task = review_task_fn(main_task)
+        review_agent = review_task.agent
+
+        if review_agent is None:
+            error_msg = "Review task is missing an agent."
+            if logger:
+                logger.error(error_msg)
+
+            # Emit error event
+            event_bus.publish(
+                EventTypes.WORKFLOW_ERROR,
+                error_msg=error_msg,
+                workflow_name=f"Task-Review-DynamicRefine Workflow for {getattr(main_task, 'name', 'Main Task')}",
+            )
+
+            return {
+                "main": main_output,
+                "review": f"ERROR: {error_msg}",
+                "iterations": 0,
+                "error": True,
+                "error_msg": error_msg,
+            }
+
+        # Emit task started event
+        event_bus.publish(
+            EventTypes.TASK_STARTED,
+            task_name=getattr(review_task, "name", "Review Task"),
+            agent_name=getattr(review_agent, "name", "Review Agent"),
+        )
+
+        review_output = review_agent.execute_task(review_task)
+        task_counter["count"] += 1
+
+        # Emit task completed event
+        event_bus.publish(
+            EventTypes.TASK_COMPLETED,
+            task_name=getattr(review_task, "name", "Review Task"),
+            task_type="review",
+            output_summary=(
+                review_output[:100] + "..."
+                if len(review_output) > 100
+                else review_output
+            ),
+        )
+
+        iterations = 0
+        refined_outputs = []
+
+        # Import the agent decision checker
+        from convoke.agents import check_agent_decision
+
+        while iterations < max_iterations:
+            event_bus.publish(
+                EventTypes.REFINEMENT_ITERATION_STARTED,
+                iteration=iterations + 1,
+                max_iterations=max_iterations,
+                task_name=getattr(main_task, "name", "Main Task"),
+            )
+
+            refine_task = refine_task_fn(main_task, review_task)
+            refine_agent = refine_task.agent
+
+            if refine_agent is None:
+                error_msg = "Refine task is missing an agent."
+                if logger:
+                    logger.error(error_msg)
+
+                # Emit error event
+                event_bus.publish(
+                    EventTypes.WORKFLOW_ERROR,
+                    error_msg=error_msg,
+                    workflow_name=f"Task-Review-DynamicRefine Workflow for {getattr(main_task, 'name', 'Main Task')}",
+                    iteration=iterations + 1,
+                )
+
+                break
+
+            # Emit task started event
+            event_bus.publish(
+                EventTypes.TASK_STARTED,
+                task_name=getattr(refine_task, "name", "Refine Task"),
+                agent_name=getattr(refine_agent, "name", "Refine Agent"),
+                iteration=iterations + 1,
+            )
+
+            refined_output = refine_agent.execute_task(refine_task)
+            refined_outputs.append(refined_output)
+            task_counter["count"] += 1
+
+            # Emit task completed event
+            event_bus.publish(
+                EventTypes.TASK_COMPLETED,
+                task_name=getattr(refine_task, "name", "Refine Task"),
+                task_type="refine",
+                output_summary=(
+                    refined_output[:100] + "..."
+                    if len(refined_output) > 100
+                    else refined_output
+                ),
+                iteration=iterations + 1,
+            )
+
+            event_bus.publish(
+                EventTypes.REFINEMENT_ITERATION_COMPLETED,
+                iteration=iterations + 1,
+                max_iterations=max_iterations,
+                task_name=getattr(main_task, "name", "Main Task"),
+            )
+
+            iterations += 1
+
+            # Update the main task for the next iteration
+            if not isinstance(main_task.context, list):
+                main_task.context = []
+            main_task.context.append(refine_task)
+
+            # Check if the agent wants to continue based on its output
+            should_continue = check_agent_decision(
+                refined_output, default_value=iterations < max_iterations
+            )
+
+            if not should_continue:
+                if logger and verbose >= 1:
+                    logger.info(
+                        f"Agent decided to stop refinement after {iterations} iterations"
+                    )
+
+                event_bus.publish(
+                    EventTypes.AGENT_DECISION,
+                    decision="stop",
+                    iteration=iterations,
+                    task_name=getattr(main_task, "name", "Main Task"),
+                )
+                break
+
+            # If we're at max iterations, break
+            if iterations >= max_iterations:
+                break
+
+            # Get a new review
+            # Emit task started event
+            event_bus.publish(
+                EventTypes.TASK_STARTED,
+                task_name=getattr(review_task, "name", "Review Task"),
+                agent_name=getattr(review_agent, "name", "Review Agent"),
+                iteration=iterations,
+            )
+
+            review_output = review_agent.execute_task(review_task)
+            task_counter["count"] += 1
+
+            # Emit task completed event
+            event_bus.publish(
+                EventTypes.TASK_COMPLETED,
+                task_name=getattr(review_task, "name", "Review Task"),
+                task_type="review",
+                output_summary=(
+                    review_output[:100] + "..."
+                    if len(review_output) > 100
+                    else review_output
+                ),
+                iteration=iterations,
+            )
+
+        # Emit workflow completed event
+        event_bus.publish(
+            EventTypes.WORKFLOW_COMPLETED,
+            workflow_name=f"Task-Review-DynamicRefine Workflow for {getattr(main_task, 'name', 'Main Task')}",
+            iterations_completed=iterations,
+            max_iterations=max_iterations,
+        )
+
         return {
-            "architecture": "",
-            "architecture_review": "",
-            "modules": [],
+            "main": main_output,
+            "review": review_output,
+            "refined": refined_outputs[-1] if refined_outputs else "",
+            "all_refined": refined_outputs,
+            "iterations": iterations,
             "error": False,
             "error_msg": None,
         }
-
-    # Define the create_refine_fn for the architect step
-    architect_crf: Callable[
-        [Callable[[str, str], Task], str, str, str, str, int], Task
-    ] = lambda ctf, n, d, oo, ro, cyc: create_refinement_task(
-        ctf,
-        n,
-        d,
-        oo,
-        ro,
-        cyc,
-        "Output MUST be a JSON array of objects with 'name' and 'description'.",
-    )
-
-    # Create tools for the Architect with the root artifact store
-    tools = [
-        scoped_save_artifact,
-        scoped_get_artifact,
-    ]
-
-    # Updated to pass tools and artifact_store
-    arch_outputs = run_task_with_review_and_refine(
-        "System Architecture",
-        requirements,
-        lambda n, d: create_architect_task(f"{n}: {d}", tools=tools),
-        lambda t: create_architect_review_task(t, tools=tools),
-        architect_crf,
-        extract_items_from_pydantic_output,
-        logger,
-        verbose,
-        review_cycles,
-        parse_retries,
-        max_items,
-        scoped_store=artifact_store,  # Pass the artifact store
-    )
-
-    if arch_outputs.get("error"):
-        # On architect error, return minimal structure
-        return {
-            "architecture": "",
-            "architecture_review": "",
-            "modules": [],
-            "error": True,
-            "error_msg": arch_outputs.get("error_msg"),
-        }
-    architecture_str = arch_outputs.get("final_output", "")
-    architecture_review = arch_outputs.get("final_review", "")
-
-    # Parse modules list from architect output
-    # CORRECTED: Use "parsed_list" from arch_outputs
-    modules = arch_outputs.get("parsed_list", [])
-
-    # Ensure modules list doesn't exceed max_items, though run_task_with_review_and_refine
-    # should have handled this if it used parse_fn.
-    if modules:  # Add this check
-        modules = modules[:max_items]
-
-    # Build handlers: functions have no children, classes call functions, modules call classes
-    function_handler = make_next_level_handler(
-        create_function_manager_task,
-        create_function_review_task,
-        lambda ctf, n, d, oo, ro, cyc: create_refinement_task(
-            ctf,
-            n,
-            d,
-            oo,
-            ro,
-            cyc,
-            "Provide the full code implementation with a docstring.",
-        ),
-        extract_items_from_pydantic_output,
-        None,
-    )
-    class_handler = make_next_level_handler(
-        create_class_manager_task,
-        create_class_review_task,
-        lambda ctf, n, d, oo, ro, cyc: create_refinement_task(
-            ctf,
-            n,
-            d,
-            oo,
-            ro,
-            cyc,
-            "Output MUST be a JSON array of objects with 'name' and 'description'.",
-        ),
-        extract_items_from_pydantic_output,
-        function_handler,
-    )
-    module_handler = make_next_level_handler(
-        create_module_manager_task,
-        create_module_review_task,
-        lambda ctf, n, d, oo, ro, cyc: create_refinement_task(
-            ctf,
-            n,
-            d,
-            oo,
-            ro,
-            cyc,
-            "Output MUST be a JSON array of objects with 'name' and 'description'.",
-        ),
-        extract_items_from_pydantic_output,
-        class_handler,
-    )
-
-    # 2. Recursive orchestration starting at module level
-    module_results = orchestrate_level(
-        modules,
-        create_module_manager_task,
-        create_module_review_task,
-        lambda ctf, n, d, oo, ro, cyc: create_refinement_task(
-            ctf,
-            n,
-            d,
-            oo,
-            ro,
-            cyc,
-            "Output MUST be a JSON array of objects with 'name' and 'description'.",
-        ),
-        extract_items_from_pydantic_output,
-        module_handler,
-        max_depth,
-        max_items,
-        logger,
-        max_tasks,
-        verbose,
-        review_cycles,
-        parse_retries,
-        artifact_store,
-        "modules",
-    )
-
-    # Save individual artifacts (designs, reviews, code, tests)
-    try:
-        ensure_dir_exists(output_dir)
     except Exception as e:
-        logger.error(f"Could not create output directory: {e}")
+        if logger:
+            logger.error(f"Task, review, or refine failed: {e}")
+
+        # Emit error event
+        event_bus.publish(
+            EventTypes.WORKFLOW_ERROR,
+            error_msg=str(e),
+            workflow_name=f"Task-Review-DynamicRefine Workflow for {getattr(main_task, 'name', 'Main Task')}",
+            exception=e,
+        )
+
         return {
-            "architecture": architecture_str,
-            "architecture_review": architecture_review,
-            "modules": module_results,
+            "main": "",
+            "review": "",
+            "refined": "",
             "error": True,
             "error_msg": str(e),
+            "iterations": 0,
         }
 
-    # Write project scaffolding and visualization
-    write_project_scaffolding(output_dir, architecture_str, modules)
-    write_tree_visualization(output_dir, module_results)
 
-    return {
-        "architecture": architecture_str,
-        "architecture_review": architecture_review,
-        "modules": module_results,
-        "error": False,
-        "error_msg": None,
-    }
+def run_task(
+    task: Dict[str, Any],
+    store: FileSystemArtifactStore,
+    output_dir: Path,
+    config: Dict[str, Any],
+    logger: Optional[logging.Logger] = None,
+    verbose: int = 0,
+    previous_task_outputs: Optional[List[Dict[str, Any]]] = None,
+    previous_level_outputs: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """Run a single task and return its output.
+
+    Args:
+        task: The task definition
+        store: The artifact store
+        output_dir: The output directory
+        config: Configuration settings
+        logger: Optional logger
+        verbose: Verbosity level
+        previous_task_outputs: Outputs from previous tasks in the same level
+        previous_level_outputs: Outputs from previous levels
+
+    Returns:
+        Dictionary containing the task output
+    """
+    # Get event bus
+    event_bus = get_event_bus(logger)
+
+    task_name = task.get("name", "Unnamed Task")
+
+    if verbose >= 1 and logger:
+        logger.info(f"Starting task: {task_name}")
+
+    # Emit task started event
+    event_bus.publish(
+        EventTypes.TASK_STARTED,
+        task_name=task_name,
+        task_type="task",
+    )
+
+    try:
+        # Create the task object
+        task_obj = Task(
+            description=task.get("description", ""),
+            expected_output=task.get("expected_output", ""),
+            agent=task.get("agent"),
+            context=task.get("context", []),
+        )
+
+        # Get the agent
+        agent = task_obj.agent
+
+        if agent is None:
+            error_msg = f"Task {task_name} missing agent"
+            if logger:
+                logger.error(error_msg)
+            return {
+                "error": True,
+                "error_msg": error_msg,
+                "output": None,
+                "output_path": None,
+            }
+
+        # Execute the task
+        output = agent.execute_task(task_obj)
+        task_counter["count"] += 1
+
+        # Save the output if we have a store
+        output_path = None
+        if store:
+            output_path = f"{task_name.replace(' ', '_')}.txt"
+            store.save_artifact(output_path, output)
+
+        # Emit task completed event
+        event_bus.publish(
+            EventTypes.TASK_COMPLETED,
+            task_name=task_name,
+            task_type="task",
+            output_path=output_path,
+        )
+
+        return {
+            "error": False,
+            "error_msg": None,
+            "output": output,
+            "output_path": output_path,
+        }
+    except Exception as e:
+        error_msg = f"Task execution failed: {str(e)}"
+        if logger:
+            logger.error(error_msg)
+
+        # Emit task error event
+        event_bus.publish(
+            EventTypes.TASK_ERROR,
+            error_msg=error_msg,
+            task_name=task_name,
+            exception=e,
+        )
+
+        return {
+            "error": True,
+            "error_msg": error_msg,
+            "output": None,
+            "output_path": None,
+        }

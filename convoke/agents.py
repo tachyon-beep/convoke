@@ -1,10 +1,14 @@
 from crewai import Agent, Task
 from pydantic import BaseModel, Field
-from typing import List, Optional
+from typing import List, Optional, Dict, Any, Callable
 from convoke.crewai_tools import BaseTool
 from convoke.tools import scoped_get_artifact, scoped_save_artifact
 from convoke.store import FileSystemArtifactStore
 import logging
+import re
+
+# Agent decision pattern for continuing iterations
+AGENT_CONTINUE_PATTERN = r"@agent\s+Continue:\s*[\"'](.+?)[\"']"
 
 
 class ItemDetail(BaseModel):
@@ -29,6 +33,112 @@ def get_default_tools():
         scoped_get_artifact,
         scoped_save_artifact,
     ]
+
+
+# Check if an agent wants to continue iteration
+def check_agent_decision(output: str, default_value: bool = False) -> bool:
+    """
+    Check if an agent's output contains a decision to continue iterating.
+    Format: @agent Continue: "Continue to iterate?"
+
+    Args:
+        output: The agent's output text
+        default_value: Default value if no decision is found
+
+    Returns:
+        True if the agent wants to continue, False otherwise
+    """
+    match = re.search(AGENT_CONTINUE_PATTERN, output)
+    if not match:
+        return default_value
+
+    decision_text = match.group(1).strip().lower()
+
+    # Positive indicators
+    if any(
+        word in decision_text
+        for word in ["yes", "continue", "proceed", "true", "iterate"]
+    ):
+        return True
+
+    # Negative indicators
+    if any(
+        word in decision_text
+        for word in ["no", "stop", "done", "false", "complete", "finished"]
+    ):
+        return False
+
+    # If unclear, return default
+    return default_value
+
+
+def check_agent_decision(text: str, default_value: bool = True) -> bool:
+    """
+    Check if the agent has indicated whether to continue or not.
+    This looks for the pattern "@agent Continue: " followed by a question or statement.
+
+    Args:
+        text: The text to check for a decision
+        default_value: The default value to return if no decision is found
+
+    Returns:
+        True if the agent wants to continue, False otherwise
+    """
+    import re
+
+    # Look for the agent decision pattern
+    pattern = r"@agent\s+Continue:\s*[\"']([^\"']+)[\"']"
+    match = re.search(pattern, text)
+
+    if not match:
+        return default_value
+
+    decision_text = match.group(1).strip().lower()
+
+    # Positive responses
+    positive_responses = [
+        "yes",
+        "continue",
+        "proceed",
+        "go ahead",
+        "keep going",
+        "iterate",
+        "refine",
+        "improve",
+        "enhance",
+        "more",
+        "not done",
+        "unfinished",
+        "incomplete",
+    ]
+
+    # Negative responses
+    negative_responses = [
+        "no",
+        "stop",
+        "halt",
+        "finished",
+        "complete",
+        "done",
+        "satisfied",
+        "sufficient",
+        "adequate",
+        "enough",
+        "conclude",
+    ]
+
+    # Check for positive indicators
+    for phrase in positive_responses:
+        if phrase in decision_text:
+            return True
+
+    # Check for negative indicators
+    for phrase in negative_responses:
+        if phrase in decision_text:
+            return False
+
+    # If we can't determine a clear answer, use the default
+    return default_value
 
 
 # --- Agent Definitions ---
@@ -215,6 +325,7 @@ def create_module_manager_task(
     module_name, module_description, tools: Optional[List[BaseTool]] = None
 ):
     agent = create_module_manager_agent(tools)
+    module_filename = f"{module_name.replace(' ', '_')}_module_design.json"
     return Task(
         description=(
             f"You are the Module Manager for module '{module_name}'. High-level description: {module_description}.\n"
@@ -223,7 +334,7 @@ def create_module_manager_task(
             f"Output MUST be a JSON object with a single key 'items', whose value is a list of objects, each with 'name' and 'description' fields. "
             f"Example: {{'items': [{{'name': 'ExampleClass', 'description': 'This is an example.'}}]}}\n"
             f"Do not include any markdown, comments, or any text outside the JSON object itself.\n"
-            f"Finally, use the 'SaveProjectArtifact' tool to save your output JSON to 'module_design.json'."
+            f"Finally, use the 'SaveProjectArtifact' tool to save your output JSON to '{module_filename}'."
         ),
         expected_output="A JSON object with an 'items' key, whose value is a list of objects with 'name' and 'description' fields, strictly conforming to the ItemListOutput schema. No extra text.",
         agent=agent,
@@ -245,22 +356,24 @@ def create_module_review_task(mod_task, tools: Optional[List[BaseTool]] = None):
 
 
 def create_class_manager_task(
-    class_name, class_description, tools: Optional[List[BaseTool]] = None
+    module_name, class_name, class_description, tools: Optional[List[BaseTool]] = None
 ):
     agent = create_class_manager_agent(tools)
+    module_filename = f"{module_name.replace(' ', '_')}_module_design.json"
     return Task(
         description=(
-            f"You are the Class Manager for class '{class_name}'. High-level description: {class_description}.\n"
-            f"Use the 'GetProjectArtifact' tool to retrieve your parent module's 'module_design.json' if needed for context.\n"
+            f"You are the Class Manager for class '{class_name}' in module '{module_name}'.\n"
+            f"High-level description: {class_description}.\n"
+            f"Use the 'GetProjectArtifact' tool to retrieve your parent module's '{module_filename}' if needed for context.\n"
             f"Design the functions/methods for this class.\n"
-            f"Output MUST be a JSON object with a single key 'items', whose value is a list of objects, each with 'name' and 'description' fields. "
-            f"Example: {{'items': [{{'name': 'ExampleFunction', 'description': 'This is an example.'}}]}}\n"
+            f"Output MUST be a JSON object with a single key 'items', whose value is a list of objects, each with 'name', 'description', and 'signature' fields.\n"
+            f"Example: {{'items': [{{'name': 'example_function', 'description': 'Example function.', 'signature': 'def example_function(param1: str) -> bool:'}}]}}\n"
             f"Do not include any markdown, comments, or any text outside the JSON object itself.\n"
             f"Finally, use the 'SaveProjectArtifact' tool to save your output JSON to '{class_name.replace(' ', '_')}_class_design.json'."
         ),
-        expected_output="A JSON object with an 'items' key, whose value is a list of objects with 'name' and 'description' fields, strictly conforming to the ItemListOutput schema. No extra text.",
+        expected_output="A JSON object with an 'items' key, whose value is a list of objects with 'name', 'description', and 'signature' fields, strictly conforming to the FunctionListOutput schema. No extra text.",
         agent=agent,
-        output_pydantic=ItemListOutput,
+        output_pydantic=FunctionListOutput,
     )
 
 

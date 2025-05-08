@@ -8,6 +8,17 @@ import argparse
 import os
 import shutil
 from datetime import datetime
+import yaml
+from convoke.agents import (
+    create_architect_task,
+    create_architect_review_task,
+    create_module_manager_task,
+    create_module_review_task,
+    create_class_manager_task,
+    create_class_review_task,
+    create_function_manager_task,
+    create_function_review_task,
+)
 
 
 def load_template(path):
@@ -52,11 +63,7 @@ def main():
     os.makedirs(outputs_dir, exist_ok=True)
     os.makedirs(logs_dir, exist_ok=True)
 
-    # Load and write config template
-    template_path = os.path.join("convoke", "config_template.yaml")
-    template = load_template(template_path)
-
-    # Insert requirements into template
+    # Get requirements
     if args.requirements:
         req_text = args.requirements
     elif args.requirements_file:
@@ -65,18 +72,63 @@ def main():
     else:
         req_text = "TODO: Add project-specific requirements here."
 
-    # Replace both possible placeholders for requirements
-    config_content = template.replace(
-        "INSERT_PROJECT_REQUIREMENTS_HERE", req_text
-    ).replace("TODO: Insert project-specific requirements here", req_text)
+    # Build config dict with agent type placeholders
+    config = {
+        "project_name": args.name,
+        "requirements": req_text,
+        "levels": [
+            {
+                "name": "System Architecture",
+                "tasks": [
+                    {
+                        "name": "System Architecture",
+                        "description": "Design the system architecture.",
+                        "agent_type": "architect",
+                        "review": {
+                            "enabled": True,
+                            "agent_type": "architect_reviewer",
+                        },
+                        "refine": {
+                            "enabled": True,
+                            "cycles": 2,
+                        },
+                    }
+                ],
+            },
+            {
+                "name": "Module Design",
+                "tasks": [
+                    {
+                        "name": "Module Design",
+                        "description": "Design the main modules for the system.",
+                        "agent_type": "module_manager",
+                        "review": {
+                            "enabled": True,
+                            "agent_type": "module_reviewer",
+                        },
+                        "refine": {
+                            "enabled": True,
+                            "cycles": 2,
+                        },
+                    }
+                ],
+            },
+        ],
+    }
+
+    # Write config.yaml
     config_path = os.path.join(project_root, "config.yaml")
-    write_file(config_path, config_content)
+    with open(config_path, "w", encoding="utf-8") as f:
+        yaml.dump(config, f, sort_keys=False)
 
     # Optionally write initial requirements markdown
     initial_md = os.path.join(project_root, "initial_requirements.md")
     write_file(initial_md, req_text)
 
     print(f"New project initialized: {project_root}")
+    print(
+        "\nNOTE: The config.yaml uses agent_type placeholders. When loading the config in your workflow runner, map agent_type to the correct agent/task factory function from convoke.agents."
+    )
 
 
 if __name__ == "__main__":

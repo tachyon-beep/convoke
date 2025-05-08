@@ -51,10 +51,26 @@ def save_project_artifact(
     content: str,
     is_json_content: bool,
     agent_role: str = None,
+    module_name: str = None,
+    class_name: str = None,
     allowed_write_prefixes: List[str] = None,
     store: Any = None,
 ) -> str:
-    """Saves a project artifact within allowed write prefixes."""
+    """Saves a project artifact within allowed write prefixes.
+
+    Args:
+        artifact_path: The path to save the artifact to
+        content: The content to save
+        is_json_content: Whether the content is JSON
+        agent_role: The role of the agent saving the artifact
+        module_name: Optional module name for prefixing filenames
+        class_name: Optional class name for prefixing filenames
+        allowed_write_prefixes: List of allowed write prefixes
+        store: Optional artifact store to use
+
+    Returns:
+        Success message or error message
+    """
     # Use the provided store or fall back to the global artifact_store
     actual_store = None
 
@@ -67,6 +83,37 @@ def save_project_artifact(
 
     if actual_store is None:
         return f"Error: No artifact store available"
+
+    # Create a more descriptive path if module or class context is provided
+    # This prevents different modules from overwriting each other's artifacts
+    if module_name or class_name:
+        path_parts = os.path.split(artifact_path)
+        filename = path_parts[1]
+        directory = path_parts[0] if len(path_parts) > 1 else ""
+
+        # If we're saving a module design and module_name is provided
+        if "module_design" in filename and module_name:
+            safe_module_name = module_name.replace(" ", "_")
+            if not filename.startswith(safe_module_name):
+                filename = f"{safe_module_name}_{filename}"
+
+        # If we're saving a class design and class_name is provided
+        elif "class_design" in filename and class_name:
+            safe_class_name = class_name.replace(" ", "_")
+            if not filename.startswith(safe_class_name):
+                filename = f"{safe_class_name}_{filename}"
+
+        # If module_name is provided but not in filename, add it as a directory
+        elif module_name and "module" not in filename and "system" not in filename:
+            safe_module_name = module_name.replace(" ", "_")
+            directory = (
+                os.path.join(directory, safe_module_name)
+                if directory
+                else safe_module_name
+            )
+
+        # Reconstruct the path
+        artifact_path = os.path.join(directory, filename) if directory else filename
 
     try:
         result = actual_store.save_artifact(

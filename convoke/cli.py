@@ -58,6 +58,46 @@ def main():
     with open(config_path, "r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
 
+    from convoke.agents import (
+        create_architect_agent,
+        create_architect_reviewer_agent,
+        create_module_manager_agent,
+        create_module_reviewer_agent,
+        create_class_manager_agent,
+        create_class_reviewer_agent,
+        create_function_manager_agent,
+        create_function_reviewer_agent,
+    )
+
+    AGENT_TYPE_MAP = {
+        "architect": create_architect_agent,
+        "architect_reviewer": create_architect_reviewer_agent,
+        "module_manager": create_module_manager_agent,
+        "module_reviewer": create_module_reviewer_agent,
+        "class_manager": create_class_manager_agent,
+        "class_reviewer": create_class_reviewer_agent,
+        "function_manager": create_function_manager_agent,
+        "function_reviewer": create_function_reviewer_agent,
+    }
+
+    def hydrate_agents(config):
+        for level in config.get("levels", []):
+            for task in level.get("tasks", []):
+                agent_type = task.pop("agent_type", None)
+                if agent_type:
+                    if agent_type not in AGENT_TYPE_MAP:
+                        raise ValueError(f"Unknown agent_type: {agent_type}")
+                    task["agent"] = AGENT_TYPE_MAP[agent_type]()
+                if "review" in task and "agent_type" in task["review"]:
+                    review_type = task["review"].pop("agent_type")
+                    if review_type not in AGENT_TYPE_MAP:
+                        raise ValueError(f"Unknown review agent_type: {review_type}")
+                    task["review"]["agent"] = AGENT_TYPE_MAP[review_type]()
+        return config
+
+    # Hydrate agents in config
+    config = hydrate_agents(config)
+
     # Use CLI args if provided, else config, else sensible defaults
     requirements = args.requirements or config.get("requirements")
     max_depth = (
@@ -104,19 +144,38 @@ def main():
     system_write_tool = scoped_save_artifact
 
     logger.info("Starting Convoke workflow...")
+
+    # Prepare config for the orchestrator
+    workflow_config = {
+        "max_depth": max_depth,
+        "max_items": max_items,
+        "max_tasks": max_tasks,
+        "review_cycles": review_cycles,
+        "parse_retries": parse_retries,
+        "store": {
+            "base_path": artifacts_dir,
+            "logger": logger,
+            "agent_role": "orchestrator",
+        },
+        "artifact_store": artifact_store,  # Include in config
+        "get_tool": system_read_tool,  # Include in config
+        "save_tool": system_write_tool,  # Include in config
+    }
+
+    # Convert output_dir to Path object
+    from pathlib import Path
+
+    output_path = Path(outputs_dir)
+
+    # Use hydrated config as workflow_def
+    workflow_def = config
+
     results = orchestrate_full_workflow(
-        requirements=requirements,
-        max_depth=max_depth,
-        max_items=max_items,
-        max_tasks=max_tasks,
+        workflow_def=workflow_def,
+        config=workflow_config,
+        output_dir=output_path,
         verbose=args.verbose,
         logger=logger,
-        review_cycles=review_cycles,
-        parse_retries=parse_retries,
-        output_dir=outputs_dir,  # Use the outputs directory for final products
-        artifact_store=artifact_store,
-        get_tool=system_read_tool,
-        save_tool=system_write_tool,
     )
     if results.get("error"):
         logger.error(f"Workflow terminated due to error: {results['error_msg']}")

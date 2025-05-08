@@ -20,7 +20,10 @@ def create_architect_agent(tools: Optional[List[BaseTool]] = None):
         goal="Design a robust, modular software system for the given requirements.",
         backstory=(
             "You are a highly experienced systems architect. You break down complex requirements "
-            "into high-level modules, ensuring scalability and maintainability."
+            "into high-level modules, ensuring scalability and maintainability.\n"
+            "You have access to the GetProjectArtifact and SaveProjectArtifact tools.\n"
+            "Use GetProjectArtifact to retrieve any relevant parent or sibling designs.\n"
+            "Use SaveProjectArtifact to save your architecture JSON to the correct path."
         ),
         verbose=True,
         allow_delegation=False,
@@ -49,7 +52,10 @@ def create_module_manager_agent(tools: Optional[List[BaseTool]] = None):
         goal="Design a module, define its classes, and delegate class design to class managers.",
         backstory=(
             "You are responsible for the detailed design of a software module. You identify the "
-            "necessary classes and delegate their design to class managers."
+            "necessary classes and delegate their design to class managers.\n"
+            "You have access to the GetProjectArtifact and SaveProjectArtifact tools.\n"
+            "Use GetProjectArtifact to retrieve parent architecture or sibling modules if needed.\n"
+            "Use SaveProjectArtifact to save your module design JSON to the correct path."
         ),
         verbose=True,
         allow_delegation=True,
@@ -77,7 +83,10 @@ def create_class_manager_agent(tools: Optional[List[BaseTool]] = None):
         goal="Design a class, define its functions, and delegate function implementation to function managers.",
         backstory=(
             "You are responsible for the design of a class within a module. You identify the necessary "
-            "functions/methods and delegate their implementation to function managers."
+            "functions/methods and delegate their implementation to function managers.\n"
+            "You have access to the GetProjectArtifact and SaveProjectArtifact tools.\n"
+            "Use GetProjectArtifact to retrieve parent module or sibling classes if needed.\n"
+            "Use SaveProjectArtifact to save your class design JSON to the correct path."
         ),
         verbose=True,
         allow_delegation=True,
@@ -156,14 +165,16 @@ def create_architect_task(requirements, tools: Optional[List[BaseTool]] = None):
     agent = create_architect_agent(tools)
     return Task(
         description=(
-            f"Analyze the following requirements and design a modular system. "
-            f"Output ONLY a JSON array of objects, each with 'name' and 'description' fields. "
-            f"Example: [{{'name': 'ModuleA', 'description': 'Handles X'}}, {{'name': 'ModuleB', 'description': 'Handles Y'}}]\n"
-            f"Do not include any markdown, comments, or text outside the JSON array.\n"
+            f"Analyze the following requirements and design a modular system.\n"
+            f"Output MUST be a JSON object with a single key 'items', whose value is a list of objects, each with 'name' and 'description' fields.\n"
+            f"Example: {{'items': [{{'name': 'ExampleModule', 'description': 'This is an example.'}}]}}\n"
+            f"Do not include any markdown, comments, or text outside the JSON object itself.\n"
+            f"Finally, use the 'SaveProjectArtifact' tool to save your output JSON to 'system_architecture.json'.\n"
             f"Requirements: {requirements}"
         ),
-        expected_output="A JSON array of objects with 'name' and 'description' fields, and nothing else.",
+        expected_output="A JSON object with an 'items' key, whose value is a list of objects with 'name' and 'description' fields, strictly conforming to the ItemListOutput schema. No extra text.",
         agent=agent,
+        output_pydantic=ItemListOutput,
     )
 
 
@@ -187,10 +198,13 @@ def create_module_manager_task(
     agent = create_module_manager_agent(tools)
     return Task(
         description=(
-            f"Design the module '{module_name}': {module_description}. "
+            f"You are the Module Manager for module '{module_name}'. High-level description: {module_description}.\n"
+            f"Use the 'GetProjectArtifact' tool to retrieve 'system_architecture.json' if needed for context.\n"
+            f"Design the classes for this module.\n"
             f"Output MUST be a JSON object with a single key 'items', whose value is a list of objects, each with 'name' and 'description' fields. "
             f"Example: {{'items': [{{'name': 'ExampleClass', 'description': 'This is an example.'}}]}}\n"
-            f"Do not include any markdown, comments, or any text outside the JSON object itself."
+            f"Do not include any markdown, comments, or any text outside the JSON object itself.\n"
+            f"Finally, use the 'SaveProjectArtifact' tool to save your output JSON to 'module_design.json'."
         ),
         expected_output="A JSON object with an 'items' key, whose value is a list of objects with 'name' and 'description' fields, strictly conforming to the ItemListOutput schema. No extra text.",
         agent=agent,
@@ -217,10 +231,13 @@ def create_class_manager_task(
     agent = create_class_manager_agent(tools)
     return Task(
         description=(
-            f"Design the class '{class_name}': {class_description}. "
+            f"You are the Class Manager for class '{class_name}'. High-level description: {class_description}.\n"
+            f"Use the 'GetProjectArtifact' tool to retrieve your parent module's 'module_design.json' if needed for context.\n"
+            f"Design the functions/methods for this class.\n"
             f"Output MUST be a JSON object with a single key 'items', whose value is a list of objects, each with 'name' and 'description' fields. "
             f"Example: {{'items': [{{'name': 'ExampleFunction', 'description': 'This is an example.'}}]}}\n"
-            f"Do not include any markdown, comments, or any text outside the JSON object itself."
+            f"Do not include any markdown, comments, or any text outside the JSON object itself.\n"
+            f"Finally, use the 'SaveProjectArtifact' tool to save your output JSON to 'class_design.json'."
         ),
         expected_output="A JSON object with an 'items' key, whose value is a list of objects with 'name' and 'description' fields, strictly conforming to the ItemListOutput schema. No extra text.",
         agent=agent,
@@ -247,8 +264,10 @@ def create_function_manager_task(
     agent = create_function_manager_agent(tools)
     return Task(
         description=(
-            f"Implement the function/method '{function_name}': {function_description}. "
-            f"Provide the full code implementation with a docstring."
+            f"You are the Function Manager for function '{function_name}'. Description: {function_description}.\n"
+            f"Use the 'GetProjectArtifact' tool to retrieve your parent class's 'class_design.json' if needed for context.\n"
+            f"Implement the function/method as specified, providing the full code implementation with a docstring.\n"
+            f"Finally, use the 'SaveProjectArtifact' tool to save your code to '{function_name}.py'."
         ),
         expected_output="The complete code for the function/method, with a docstring.",
         agent=agent,

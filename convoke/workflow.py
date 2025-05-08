@@ -18,7 +18,7 @@ from convoke.agents import (
     create_function_review_task,
     ItemListOutput,
 )
-from convoke.parsers import parse_json_list
+from convoke.parsers import parse_json_list, extract_items_from_pydantic_output
 from convoke.project import write_project_scaffolding, write_tree_visualization
 import os
 from convoke.utils import (
@@ -30,94 +30,10 @@ from convoke.utils import (
 from convoke.agents import create_test_developer_task, create_test_review_task
 
 __all__ = [
-    "parse_numbered_list",
     "parse_json_list",
     "orchestrate_level",
     "orchestrate_full_workflow",
 ]
-
-
-def parse_numbered_list(text: str, max_items: int = 10) -> List[Tuple[str, str]]:
-    if not isinstance(text, str):
-        return []
-    try:
-        lines = text.splitlines()
-    except Exception:
-        return []
-    items = []
-    current_name = None
-    current_desc_lines = []
-    import re
-
-    for line in lines:
-        m = re.match(r"^\s*(\d+|[-*])\.?\s+([^:]+):?\s*(.*)$", line)
-        if m:
-            if current_name is not None:
-                items.append((current_name, "\n".join(current_desc_lines).strip()))
-            current_name = m.group(2).strip()
-            desc = m.group(3).strip()
-            current_desc_lines = [desc] if desc else []
-        elif current_name is not None and not re.match(r"^\s*(\d+|[-*])\.?\s+", line):
-            current_desc_lines.append(line)
-    if current_name is not None:
-        items.append((current_name, "\n".join(current_desc_lines).strip()))
-    return items[:max_items]
-
-
-def parse_json_list(
-    text: str, max_items: int = 10, logger: Optional[logging.Logger] = None
-) -> List[Tuple[str, str]]:
-    import re
-
-    local_logger = logger or logging.getLogger(__name__)
-    if not isinstance(text, str) or not text.strip():
-        if text is None:
-            local_logger.warning("parse_json_list received None input.")
-        elif not text.strip():
-            local_logger.warning(
-                "parse_json_list received empty or whitespace-only string."
-            )
-        return []
-    try:
-        match = re.search(r"(\[[\s\S]*\])", text)
-        if not match:
-            local_logger.warning(
-                f"parse_json_list: Could not find a JSON array structure in text starting with: {text[:200]}..."
-            )
-            return []
-        json_text = match.group(1)
-        data = json.loads(json_text)
-        items = []
-        if isinstance(data, list):
-            for item_dict in data:
-                if (
-                    isinstance(item_dict, dict)
-                    and "name" in item_dict
-                    and "description" in item_dict
-                ):
-                    items.append(
-                        (str(item_dict["name"]), str(item_dict["description"]))
-                    )
-                else:
-                    local_logger.warning(
-                        f"parse_json_list: Skipping invalid item in JSON list: {item_dict}"
-                    )
-            return items[:max_items]
-        else:
-            local_logger.warning(
-                f"parse_json_list: Parsed JSON is not a list. Type: {type(data)}. Data: {str(data)[:200]}..."
-            )
-            return []
-    except json.JSONDecodeError as e:
-        local_logger.error(
-            f"parse_json_list: JSONDecodeError parsing text: {e}. Text snippet: {text[:500]}..."
-        )
-        return []
-    except Exception as e:
-        local_logger.error(
-            f"parse_json_list: Unexpected error parsing JSON: {e}. Text snippet: {text[:500]}..."
-        )
-        return []
 
 
 task_counter = {"count": 0}
@@ -183,13 +99,13 @@ def run_task_with_review(
 
 def orchestrate_level(
     items: List[Tuple[str, str]],
-    create_task_fn: Callable[[str, str, Optional[list]], Task],
+    create_task_fn: Callable[[str, str, Optional[List[Any]]], Task],
     create_review_fn: Callable[[Task], Task],
     create_refine_fn: Callable[
-        [Callable[[str, str, Optional[list]], Task], str, str, str, str, int], Task
+        [Callable[[str, str, Optional[List[Any]]], Task], str, str, str, str, int], Task
     ],
     parse_fn: Callable[[str, int], List[Tuple[str, str]]],
-    next_level_fn_or_depth: Optional[Union[Callable, int]],
+    next_level_fn_or_depth: Optional[Union[Callable[..., List[Dict[str, Any]]], int]],
     max_depth: int,
     max_items: int,
     logger: logging.Logger,
@@ -197,7 +113,7 @@ def orchestrate_level(
     verbose: int,
     review_cycles: int,
     parse_retries: int,
-    artifact_store: FileSystemArtifactStore = None,
+    artifact_store: Optional[FileSystemArtifactStore] = None,
     current_scope_path: str = "",
 ) -> List[Dict[str, Any]]:
     # Handle both legacy usage and new usage
@@ -254,8 +170,10 @@ def orchestrate_level(
             name,
             desc,
             lambda n, d: create_task_fn(n, d, tools),
-            lambda t: create_review_fn(t, tools),
-            create_refine_fn,
+            lambda t: create_review_fn(t),
+            lambda ctf, n, d, oo, ro, cyc: create_refinement_task(
+                ctf, n, d, oo, ro, cyc, "Output MUST be a JSON array of objects with 'name' and 'description'."
+            ),
             parse_fn,
             logger,
             verbose,
@@ -343,6 +261,7 @@ def run_task_with_review_and_refine(
                 current_output if current_output is not None else "",
                 current_review if current_review is not None else "",
                 cycle,
+                "Output MUST be a JSON array of objects with 'name' and 'description'."
             )
         for attempt in range(parse_retries):
             try:
@@ -481,34 +400,12 @@ def create_refinement_task(
     )
 
 
-import re
-
-
-def extract_json_from_output(text: str) -> str:
-    match = re.search(r"(\[[\s\S]*\])", text)
-    if match:
-        return match.group(1)
-    return ""
-
-
-def extract_items_from_pydantic_output(
-    task_output, max_items: int = 10
-) -> List[Tuple[str, str]]:
-    if hasattr(task_output, "pydantic") and isinstance(
-        task_output.pydantic, ItemListOutput
-    ):
-        return [(item.name, item.description) for item in task_output.pydantic.items][
-            :max_items
-        ]
-    return []
-
-
 # Fix the wrapped_next function in make_next_level_handler_with_tools to match signature
 def make_next_level_handler(
-    create_task_fn: Callable[[str, str], Task],
+    create_task_fn: Callable[[str, str, Optional[List[Any]]], Task],
     create_review_fn: Callable[[Task], Task],
     create_refine_fn: Callable[
-        [Callable[[str, str], Task], str, str, str, str, int], Task
+        [Callable[[str, str, Optional[List[Any]]], Task], str, str, str, str, int], Task
     ],
     parse_fn: Callable[[str, int], List[Tuple[str, str]]],
     next_level_fn: Optional[Callable],
@@ -590,23 +487,31 @@ def orchestrate_full_workflow(
             "error_msg": None,
         }
 
-    # 1. System Architecture with review and refinement
-    # wrap architect fns to match expected signatures
+    # Correct architect_ctf lambda to pass both name and desc
     architect_ctf: Callable[[str, str], Task] = (
-        lambda name, desc: create_architect_task(desc)
+        lambda name, desc: create_architect_task(f"{name}: {desc}", tools=None)  # Pass both name and desc
     )
     architect_rtf: Callable[[Task], Task] = lambda t: create_architect_review_task(t)
+    
+    # Define the create_refine_fn for the architect step
+    architect_crf: Callable[
+        [Callable[[str, str], Task], str, str, str, str, int], Task
+    ] = lambda ctf, n, d, oo, ro, cyc: create_refinement_task(
+        ctf, n, d, oo, ro, cyc, "Output MUST be a JSON array of objects with 'name' and 'description'."
+    )
+
     arch_outputs = run_task_with_review_and_refine(
         "System Architecture",
         requirements,
         architect_ctf,
         architect_rtf,
+        architect_crf,  # Added the missing create_refine_fn
         extract_items_from_pydantic_output,  # Use pydantic extractor for architect
         logger,
         verbose,
         review_cycles,
         parse_retries,
-        max_items,
+        max_items,  # Ensure max_items is passed
     )
     if arch_outputs.get("error"):
         # On architect error, return minimal structure
@@ -621,87 +526,56 @@ def orchestrate_full_workflow(
     architecture_review = arch_outputs.get("final_review", "")
 
     # Parse modules list from architect output
-    modules = parse_json_list(
-        extract_json_from_output(architecture_str), max_items, logger
-    )
-
-    # Internal helpers for wrapping task and review functions
-    def _wrap_task(orig_fn, name, desc, role, parent_scope):
-        task = orig_fn(name, desc)
-        slug = name.replace(" ", "_")
-        scope_path = os.path.join(parent_scope, slug).lstrip("/")
-        get_scoped = ScopedGetArtifactTool(
-            store=artifact_store, agent_role=role, allowed_read_prefixes=[parent_scope]
-        )
-        save_scoped = ScopedSaveArtifactTool(
-            store=artifact_store, agent_role=role, allowed_write_prefixes=[scope_path]
-        )
-        task.agent.tools = [get_scoped, save_scoped]
-        return task
-
-    def _wrap_review(orig_review_fn, task_obj):
-        review_task = orig_review_fn(task_obj)
-        review_task.agent.tools = getattr(task_obj.agent, "tools", [])
-        return review_task
-
-    # Output format instructions for each level
-    json_output_instruction = (
-        "Output MUST be a JSON array of objects, each with 'name' and 'description' fields, "
-        "e.g. [{'name': 'ModuleName', 'description': 'Purpose of the module'}, ...] (no extra text, no explanation)."
-    )
-    numbered_list_instruction = "Output in the required format: Each item MUST be in the format '1. Name: Description' (one per line, no extra text)."
-    function_code_instruction = "Provide the full code implementation with a docstring, ensuring it meets the original requirements and addresses the review feedback."
-
-    architect_create_refine_fn = lambda ctf, n, d, oo, ro, cyc: create_refinement_task(
-        ctf, n, d, oo, ro, cyc, json_output_instruction
-    )
-    module_create_refine_fn = lambda ctf, n, d, oo, ro, cyc: create_refinement_task(
-        ctf, n, d, oo, ro, cyc, json_output_instruction
-    )
-    class_create_refine_fn = lambda ctf, n, d, oo, ro, cyc: create_refinement_task(
-        ctf, n, d, oo, ro, cyc, json_output_instruction
-    )
-    function_create_refine_fn = lambda ctf, n, d, oo, ro, cyc: create_refinement_task(
-        ctf, n, d, oo, ro, cyc, function_code_instruction
-    )
+    modules = extract_items_from_pydantic_output(arch_outputs.get("final_output"))
 
     # Build handlers: functions have no children, classes call functions, modules call classes
-    function_handler = make_next_level_handler_with_tools(
+    function_handler = make_next_level_handler(
         create_function_manager_task,
         create_function_review_task,
-        "Function Manager",
-        parse_json_list,
+        lambda ctf, n, d, oo, ro, cyc: create_refinement_task(
+            ctf, n, d, oo, ro, cyc, "Provide the full code implementation with a docstring."
+        ),
+        extract_items_from_pydantic_output,
         None,
     )
-    class_handler = make_next_level_handler_with_tools(
+    class_handler = make_next_level_handler(
         create_class_manager_task,
         create_class_review_task,
-        "Class Manager",
-        parse_json_list,
+        lambda ctf, n, d, oo, ro, cyc: create_refinement_task(
+            ctf, n, d, oo, ro, cyc, "Output MUST be a JSON array of objects with 'name' and 'description'."
+        ),
+        extract_items_from_pydantic_output,
         function_handler,
     )
-    module_handler = make_next_level_handler_with_tools(
+    module_handler = make_next_level_handler(
         create_module_manager_task,
         create_module_review_task,
-        "Module Manager",
-        parse_json_list,
+        lambda ctf, n, d, oo, ro, cyc: create_refinement_task(
+            ctf, n, d, oo, ro, cyc, "Output MUST be a JSON array of objects with 'name' and 'description'."
+        ),
+        extract_items_from_pydantic_output,
         class_handler,
     )
 
     # 2. Recursive orchestration starting at module level
-    module_results = module_handler(
+    module_results = orchestrate_level(
         modules,
-        "",  # top-level scope
-        recursion_depth=0,
-        max_depth=max_depth,
-        max_items=max_items,
-        logger=logger,
-        max_tasks=max_tasks,
-        verbose=verbose,
-        review_cycles=review_cycles,
-        parse_retries=parse_retries,
-        artifact_store=artifact_store,
-        current_scope_path="",
+        create_module_manager_task,
+        create_module_review_task,
+        lambda ctf, n, d, oo, ro, cyc: create_refinement_task(
+            ctf, n, d, oo, ro, cyc, "Output MUST be a JSON array of objects with 'name' and 'description'."
+        ),
+        extract_items_from_pydantic_output,
+        module_handler,
+        max_depth,
+        max_items,
+        logger,
+        max_tasks,
+        verbose,
+        review_cycles,
+        parse_retries,
+        artifact_store,
+        "modules",
     )
 
     # Save individual artifacts (designs, reviews, code, tests)
@@ -709,151 +583,13 @@ def orchestrate_full_workflow(
         ensure_dir_exists(output_dir)
     except Exception as e:
         logger.error(f"Could not create output directory: {e}")
-    for mod in module_results:
-        # Save module artifacts
-        try:
-            mod_dir = os.path.join(output_dir, mod["name"].replace(" ", "_"))
-            ensure_dir_exists(mod_dir)
-            try:
-                write_json_file(
-                    os.path.join(mod_dir, "module_design.json"),
-                    {
-                        "name": mod["name"],
-                        "description": mod["description"],
-                        "cycles": mod["cycles"],
-                        "final_output": mod["final_output"],
-                    },
-                )
-            except Exception as e:
-                logger.error(
-                    f"Error saving module_design.json for '{mod['name']}']: {e}"
-                )
-            try:
-                write_text_file(
-                    os.path.join(mod_dir, "module_review.txt"),
-                    mod["final_review"] or "",
-                )
-            except Exception as e:
-                logger.error(
-                    f"Error saving module_review.txt for '{mod['name']}']: {e}"
-                )
-        except Exception as e:
-            logger.error(f"Error preparing module directory for '{mod['name']}']: {e}")
-        for cls in mod.get("children", []):
-            # Save class artifacts
-            try:
-                cls_dir = os.path.join(mod_dir, cls["name"].replace(" ", "_"))
-                ensure_dir_exists(cls_dir)
-                try:
-                    write_json_file(
-                        os.path.join(cls_dir, "class_design.json"),
-                        {
-                            "name": cls["name"],
-                            "description": cls["description"],
-                            "cycles": cls["cycles"],
-                            "final_output": cls["final_output"],
-                        },
-                    )
-                except Exception as e:
-                    logger.error(
-                        f"Error saving class_design.json for '{cls['name']}']: {e}"
-                    )
-                try:
-                    write_text_file(
-                        os.path.join(cls_dir, "class_review.txt"),
-                        cls["final_review"] or "",
-                    )
-                except Exception as e:
-                    logger.error(
-                        f"Error saving class_review.txt for '{cls['name']}']: {e}"
-                    )
-            except Exception as e:
-                logger.error(
-                    f"Error preparing class directory for '{cls['name']}']: {e}"
-                )
-            for fn in cls.get("children", []):
-                try:
-                    fn_file = os.path.join(
-                        cls_dir, f"{fn['name'].replace(' ', '_')}.py"
-                    )
-                    try:
-                        write_text_file(fn_file, fn["final_output"] or "")
-                    except Exception as e:
-                        logger.error(
-                            f"Error saving function code for '{fn['name']}']: {e}"
-                        )
-                    try:
-                        write_text_file(
-                            os.path.join(
-                                cls_dir, f"{fn['name'].replace(' ', '_')}_review.txt"
-                            ),
-                            fn["final_review"] or "",
-                        )
-                    except Exception as e:
-                        logger.error(
-                            f"Error saving function review for '{fn['name']}']: {e}"
-                        )
-                    if fn["final_output"]:
-                        # Lint code
-                        try:
-                            lint_result = lint_python_code(fn["final_output"])
-                            write_text_file(
-                                os.path.join(
-                                    cls_dir, f"{fn['name'].replace(' ', '_')}_lint.txt"
-                                ),
-                                lint_result,
-                            )
-                        except Exception as le:
-                            logger.error(
-                                f"Linting failed for function '{fn['name']}']: {le}"
-                            )
-                        # Generate and review tests
-                        try:
-                            test_task = create_test_developer_task(
-                                fn["name"], fn["final_output"]
-                            )
-                            test_review_task = create_test_review_task(test_task)
-                            test_crew = Crew(
-                                agents=[test_task.agent, test_review_task.agent],
-                                tasks=[test_task, test_review_task],
-                                process=Process.sequential,
-                                verbose=False,
-                            )
-                            test_crew.kickoff()
-                            test_code = getattr(test_task.output, "raw", "")
-                            test_review = getattr(test_review_task.output, "raw", "")
-                            try:
-                                write_text_file(
-                                    os.path.join(
-                                        cls_dir,
-                                        f"test_{fn['name'].replace(' ', '_')}.py",
-                                    ),
-                                    test_code,
-                                )
-                            except Exception as e:
-                                logger.error(
-                                    f"Error saving test code for '{fn['name']}']: {e}"
-                                )
-                            try:
-                                write_text_file(
-                                    os.path.join(
-                                        cls_dir,
-                                        f"test_{fn['name'].replace(' ', '_')}_review.txt",
-                                    ),
-                                    test_review,
-                                )
-                            except Exception as e:
-                                logger.error(
-                                    f"Error saving test review for '{fn['name']}']: {e}"
-                                )
-                        except Exception as te:
-                            logger.error(
-                                f"Test generation failed for function '{fn['name']}']: {te}"
-                            )
-                except Exception as e:
-                    logger.error(
-                        f"Error preparing function artifacts for '{fn['name']}']: {e}"
-                    )
+        return {
+            "architecture": architecture_str,
+            "architecture_review": architecture_review,
+            "modules": module_results,
+            "error": True,
+            "error_msg": str(e),
+        }
 
     # Write project scaffolding and visualization
     write_project_scaffolding(output_dir, architecture_str, modules)

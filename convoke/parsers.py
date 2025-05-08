@@ -2,6 +2,7 @@ import logging
 import json
 import re
 from typing import List, Tuple, Optional
+from convoke.agents import ItemListOutput
 
 
 def parse_numbered_list(text: str, max_items: int = 10) -> List[Tuple[str, str]]:
@@ -80,3 +81,19 @@ def parse_json_list(
             f"parse_json_list: Unexpected error parsing JSON: {e}. Text snippet: {text[:500]}..."
         )
         return []
+
+
+def extract_items_from_pydantic_output(task_output, max_items: int = 10) -> List[Tuple[str, str]]:
+    """
+    Extracts items from a Pydantic output model (ItemListOutput).
+
+    Args:
+        task_output: The task output containing a Pydantic model.
+        max_items: Maximum number of items to extract.
+
+    Returns:
+        A list of tuples containing item names and descriptions.
+    """
+    if hasattr(task_output, "pydantic") and isinstance(task_output.pydantic, ItemListOutput):
+        return [(item.name, item.description) for item in task_output.pydantic.items][:max_items]
+    return []

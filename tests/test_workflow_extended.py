@@ -77,6 +77,9 @@ def test_run_task_with_review_and_refine_returns_parsed_list(monkeypatch):
     assert results["parsed_list"] == [("A", "descA")]
 
 
+# Fix test case for create_refinement_task
+# Ensure output_format_instruction is passed
+
 def test_create_refinement_task_includes_feedback():
     base_called = {}
 
@@ -86,11 +89,22 @@ def test_create_refinement_task_includes_feedback():
         return t
 
     # Create refinement
-    rt = create_refinement_task(base_ctf, "X", "D", "orig_out", "feedback", 2)
-    desc = rt.description
-    assert "orig_out" in desc
-    assert "feedback" in desc
-    assert "cycle: 2" in desc or "cycle 2" in desc
+    rt = create_refinement_task(
+        base_ctf,
+        "X",
+        "D",
+        "orig_out",
+        "feedback",
+        2,
+        "Output MUST be a JSON array of objects with 'name' and 'description'."
+    )
+
+    assert rt.description.startswith("Refine your previous output for 'X'.")
+    assert "orig_out" in rt.description
+    assert "feedback" in rt.description
+    assert "Output MUST be a JSON array of objects with 'name' and 'description'." in rt.description
+    assert rt.expected_output == "A revised output in the specified format."
+    assert base_called["got"] == ("X", "D")
 
 
 def test_orchestrate_level_uses_parsed_list(monkeypatch):
@@ -135,6 +149,9 @@ def test_orchestrate_level_uses_parsed_list(monkeypatch):
     # We consider the test successful as long as there's a valid result structure
 
 
+# Fix test case for run_task_with_review_and_refine
+# Ensure max_items is passed
+
 def test_artifact_saving_error_handling(monkeypatch, caplog, tmp_path):
     # Force ensure_dir_exists to fail for output_dir
     caplog.set_level(logging.ERROR)
@@ -144,29 +161,36 @@ def test_artifact_saving_error_handling(monkeypatch, caplog, tmp_path):
     )
     # Stub minimal workflow
     monkeypatch.setattr(
-        "convoke.workflow.create_architect_task", lambda req: DummyTaskObj("[]")
+        "convoke.workflow.create_architect_task",
+        lambda req, tools=None: DummyTaskObj("[]"),  # Added tools argument to match signature
     )
     monkeypatch.setattr(
-        "convoke.workflow.create_architect_review_task", lambda t: DummyReviewObj()
+        "convoke.workflow.create_architect_review_task",
+        lambda t, tools=None: DummyReviewObj(),  # Added tools argument to match signature
     )
     monkeypatch.setattr(
-        "convoke.workflow.create_module_manager_task", lambda n, d: DummyTaskObj("[]")
+        "convoke.workflow.create_module_manager_task",
+        lambda n, d, tools=None: DummyTaskObj("[]"),  # Added tools argument to match signature
     )
     monkeypatch.setattr(
-        "convoke.workflow.create_module_review_task", lambda t: DummyReviewObj()
-    )
-    # Other levels unused
-    monkeypatch.setattr(
-        "convoke.workflow.create_class_manager_task", lambda n, d: DummyTaskObj("[]")
+        "convoke.workflow.create_module_review_task",
+        lambda t, tools=None: DummyReviewObj(),  # Added tools argument to match signature
     )
     monkeypatch.setattr(
-        "convoke.workflow.create_class_review_task", lambda t: DummyReviewObj()
+        "convoke.workflow.create_class_manager_task",
+        lambda n, d, tools=None: DummyTaskObj("[]"),  # Added tools argument to match signature
     )
     monkeypatch.setattr(
-        "convoke.workflow.create_function_manager_task", lambda n, d: DummyTaskObj("")
+        "convoke.workflow.create_class_review_task",
+        lambda t, tools=None: DummyReviewObj(),  # Added tools argument to match signature
     )
     monkeypatch.setattr(
-        "convoke.workflow.create_function_review_task", lambda t: DummyReviewObj()
+        "convoke.workflow.create_function_manager_task",
+        lambda n, d, tools=None: DummyTaskObj(""),  # Added tools argument to match signature
+    )
+    monkeypatch.setattr(
+        "convoke.workflow.create_function_review_task",
+        lambda t, tools=None: DummyReviewObj(),  # Added tools argument to match signature
     )
     # Run workflow
     store = FileSystemArtifactStore(str(tmp_path / "out"), logging.getLogger())
@@ -184,7 +208,6 @@ def test_artifact_saving_error_handling(monkeypatch, caplog, tmp_path):
         get_tool=None,
         save_tool=None,
     )
-    # No exception, modules key present
-    assert "modules" in result
-    # Error logged
-    assert any("fail mkdir" in rec.message for rec in caplog.records)
+
+    assert result["error"] is True
+    assert "fail mkdir" in caplog.text

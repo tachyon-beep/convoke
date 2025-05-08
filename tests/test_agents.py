@@ -20,6 +20,8 @@ from convoke.agents import (
     create_test_developer_task,
     create_test_review_task,
 )
+from convoke.tools import scoped_get_artifact, scoped_save_artifact
+from convoke.store import FileSystemArtifactStore
 
 
 def test_agent_factories():
@@ -58,3 +60,18 @@ def test_task_factories():
     assert hasattr(t9, "description")
     t10 = create_test_review_task(t9)
     assert hasattr(t10, "description")
+
+
+def test_agent_with_tools():
+    artifact_store = FileSystemArtifactStore(base_path="/tmp")
+    tools = [
+        scoped_get_artifact,
+        scoped_save_artifact,
+    ]
+
+    # Ensure no validation errors occur when creating the agent
+    agent = create_module_manager_agent(tools=tools)
+    assert agent is not None
+    assert len(agent.tools) == 2
+    assert agent.tools[0].name == "GetProjectArtifact"
+    assert agent.tools[1].name == "SaveProjectArtifact"

@@ -57,3 +57,7 @@ class FileSystemArtifactStore:
         if os.path.isdir(full_dir):
             return os.listdir(full_dir)
         return []
+
+    def __get_pydantic_core_schema__(self, handler):
+        """Define how Pydantic should handle this type."""
+        return handler.generate_schema(str)

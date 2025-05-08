@@ -80,6 +80,7 @@ def test_run_task_with_review_and_refine_returns_parsed_list(monkeypatch):
 # Fix test case for create_refinement_task
 # Ensure output_format_instruction is passed
 
+
 def test_create_refinement_task_includes_feedback():
     base_called = {}
 
@@ -96,13 +97,16 @@ def test_create_refinement_task_includes_feedback():
         "orig_out",
         "feedback",
         2,
-        "Output MUST be a JSON array of objects with 'name' and 'description'."
+        "Output MUST be a JSON array of objects with 'name' and 'description'.",
     )
 
     assert rt.description.startswith("Refine your previous output for 'X'.")
     assert "orig_out" in rt.description
     assert "feedback" in rt.description
-    assert "Output MUST be a JSON array of objects with 'name' and 'description'." in rt.description
+    assert (
+        "Output MUST be a JSON array of objects with 'name' and 'description'."
+        in rt.description
+    )
     assert rt.expected_output == "A revised output in the specified format."
     assert base_called["got"] == ("X", "D")
 
@@ -152,6 +156,7 @@ def test_orchestrate_level_uses_parsed_list(monkeypatch):
 # Fix test case for run_task_with_review_and_refine
 # Ensure max_items is passed
 
+
 def test_artifact_saving_error_handling(monkeypatch, caplog, tmp_path):
     # Force ensure_dir_exists to fail for output_dir
     caplog.set_level(logging.ERROR)
@@ -162,7 +167,9 @@ def test_artifact_saving_error_handling(monkeypatch, caplog, tmp_path):
     # Stub minimal workflow
     monkeypatch.setattr(
         "convoke.workflow.create_architect_task",
-        lambda req, tools=None: DummyTaskObj("[]"),  # Added tools argument to match signature
+        lambda req, tools=None: DummyTaskObj(
+            "[]"
+        ),  # Added tools argument to match signature
     )
     monkeypatch.setattr(
         "convoke.workflow.create_architect_review_task",
@@ -170,7 +177,9 @@ def test_artifact_saving_error_handling(monkeypatch, caplog, tmp_path):
     )
     monkeypatch.setattr(
         "convoke.workflow.create_module_manager_task",
-        lambda n, d, tools=None: DummyTaskObj("[]"),  # Added tools argument to match signature
+        lambda n, d, tools=None: DummyTaskObj(
+            "[]"
+        ),  # Added tools argument to match signature
     )
     monkeypatch.setattr(
         "convoke.workflow.create_module_review_task",
@@ -178,7 +187,9 @@ def test_artifact_saving_error_handling(monkeypatch, caplog, tmp_path):
     )
     monkeypatch.setattr(
         "convoke.workflow.create_class_manager_task",
-        lambda n, d, tools=None: DummyTaskObj("[]"),  # Added tools argument to match signature
+        lambda n, d, tools=None: DummyTaskObj(
+            "[]"
+        ),  # Added tools argument to match signature
     )
     monkeypatch.setattr(
         "convoke.workflow.create_class_review_task",
@@ -186,7 +197,9 @@ def test_artifact_saving_error_handling(monkeypatch, caplog, tmp_path):
     )
     monkeypatch.setattr(
         "convoke.workflow.create_function_manager_task",
-        lambda n, d, tools=None: DummyTaskObj(""),  # Added tools argument to match signature
+        lambda n, d, tools=None: DummyTaskObj(
+            ""
+        ),  # Added tools argument to match signature
     )
     monkeypatch.setattr(
         "convoke.workflow.create_function_review_task",

@@ -59,7 +59,7 @@ def create_module_manager_agent(tools: Optional[List[BaseTool]] = None):
         ),
         verbose=True,
         allow_delegation=True,
-        tools=tools,
+        tools=tools or [],
     )
 
 

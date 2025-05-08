@@ -83,7 +83,9 @@ def parse_json_list(
         return []
 
 
-def extract_items_from_pydantic_output(task_output, max_items: int = 10) -> List[Tuple[str, str]]:
+def extract_items_from_pydantic_output(
+    task_output, max_items: int = 10
+) -> List[Tuple[str, str]]:
     """
     Extracts items from a Pydantic output model (ItemListOutput).
 
@@ -94,6 +96,10 @@ def extract_items_from_pydantic_output(task_output, max_items: int = 10) -> List
     Returns:
         A list of tuples containing item names and descriptions.
     """
-    if hasattr(task_output, "pydantic") and isinstance(task_output.pydantic, ItemListOutput):
-        return [(item.name, item.description) for item in task_output.pydantic.items][:max_items]
+    if hasattr(task_output, "pydantic") and isinstance(
+        task_output.pydantic, ItemListOutput
+    ):
+        return [(item.name, item.description) for item in task_output.pydantic.items][
+            :max_items
+        ]
     return []

@@ -3,8 +3,9 @@ import os
 import logging
 import json
 import pytest
-from convoke.workflow import parse_numbered_list, parse_json_list, orchestrate_level
+from convoke.workflow import parse_json_list, orchestrate_level
 from convoke.workflow import orchestrate_full_workflow, run_task_with_review
+from convoke.parsers import parse_numbered_list
 
 import convoke.workflow
 
@@ -68,7 +69,7 @@ def test_parse_json_list_invalid():
 
 def test_orchestrate_level_minimal():
     # Dummy task functions for dry-run
-    def dummy_task_fn(name, desc):
+    def dummy_task_fn(name, desc, tools):
         class DummyTask:
             agent = object()
             output = type(
@@ -92,7 +93,7 @@ def test_orchestrate_level_minimal():
         return DummyReview()
 
     def dummy_refine_fn(*a, **k):
-        return dummy_task_fn(a[1], a[2])
+        return dummy_task_fn(a[1], a[2], None)
 
     def dummy_parse_fn(text, max_items):
         return [("Child", "desc")] if text else []

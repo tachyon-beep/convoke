@@ -4,7 +4,7 @@ from crewai import Task, Crew, Process
 from convoke.agents import ItemListOutput
 from convoke.utils import lint_python_code
 from convoke.store import FileSystemArtifactStore
-from convoke.tools import ScopedGetArtifactTool, ScopedSaveArtifactTool
+from convoke.tools import scoped_get_artifact, scoped_save_artifact
 import json
 from convoke.project import write_project_scaffolding, write_tree_visualization
 from convoke.agents import (
@@ -49,18 +49,8 @@ def run_task_with_review(
         review_task = review_task_fn(main_task)
         main_agent = main_task.agent
         review_agent = review_task.agent
-        if main_agent is None:
-            error_msg = "Main task is missing an agent."
-            if logger:
-                logger.error(error_msg)
-            return {
-                "main": "",
-                "review": f"ERROR: {error_msg}",
-                "error": True,
-                "error_msg": error_msg,
-            }
-        if review_agent is None:
-            error_msg = "Review task is missing an agent."
+        if (main_agent is None) or (review_agent is None):
+            error_msg = "Main task or review task is missing an agent."
             if logger:
                 logger.error(error_msg)
             return {
@@ -151,20 +141,10 @@ def orchestrate_level(
             allowed_read_prefixes.append("")  # root
         allowed_read_prefixes = list(set(allowed_read_prefixes))
         allowed_write_prefixes = [item_full_scope_path]
-        tools = []
-        if artifact_store:
-            tools = [
-                ScopedGetArtifactTool(
-                    store=artifact_store,
-                    agent_role=role,
-                    allowed_read_prefixes=allowed_read_prefixes,
-                ),
-                ScopedSaveArtifactTool(
-                    store=artifact_store,
-                    agent_role=role,
-                    allowed_write_prefixes=allowed_write_prefixes,
-                ),
-            ]
+        tools = [
+            scoped_save_artifact,  # Pass the Tool object directly
+            scoped_get_artifact,
+        ]
         # Pass tools to agent creation for both main and review tasks
         outputs = run_task_with_review_and_refine(
             name,
@@ -172,7 +152,13 @@ def orchestrate_level(
             lambda n, d: create_task_fn(n, d, tools),
             lambda t: create_review_fn(t),
             lambda ctf, n, d, oo, ro, cyc: create_refinement_task(
-                ctf, n, d, oo, ro, cyc, "Output MUST be a JSON array of objects with 'name' and 'description'."
+                ctf,
+                n,
+                d,
+                oo,
+                ro,
+                cyc,
+                "Output MUST be a JSON array of objects with 'name' and 'description'.",
             ),
             parse_fn,
             logger,
@@ -261,7 +247,7 @@ def run_task_with_review_and_refine(
                 current_output if current_output is not None else "",
                 current_review if current_review is not None else "",
                 cycle,
-                "Output MUST be a JSON array of objects with 'name' and 'description'."
+                "Output MUST be a JSON array of objects with 'name' and 'description'.",
             )
         for attempt in range(parse_retries):
             try:
@@ -400,7 +386,7 @@ def create_refinement_task(
     )
 
 
-# Fix the wrapped_next function in make_next_level_handler_with_tools to match signature
+# Updated `make_next_level_handler` to include `artifact_store` and `current_scope_path` in the handler's signature and logic.
 def make_next_level_handler(
     create_task_fn: Callable[[str, str, Optional[List[Any]]], Task],
     create_review_fn: Callable[[Task], Task],
@@ -420,22 +406,111 @@ def make_next_level_handler(
         verbose: int,
         review_cycles: int,
         parse_retries: int,
+        artifact_store: Optional[FileSystemArtifactStore] = None,
+        current_scope_path: str = "",
     ) -> List[Dict[str, Any]]:
-        return orchestrate_level(
-            items,
-            create_task_fn,
-            create_review_fn,
-            create_refine_fn,
-            parse_fn,
-            recursion_depth,
-            max_depth,
-            max_items,
-            logger,
-            max_tasks,
-            verbose,
-            review_cycles,
-            parse_retries,
-        )
+        if recursion_depth > max_depth:
+            logger.warning(
+                f"Recursion depth {recursion_depth} exceeds max {max_depth}. Aborting deeper recursion."
+            )
+            return []
+        results = []
+        for name, desc in items[:max_items]:
+            if task_counter["count"] >= max_tasks:
+                logger.warning(
+                    f"Task cap reached ({max_tasks}). Halting further spawning."
+                )
+                break
+            # Compute scope for this item
+            item_full_scope_path = os.path.join(
+                current_scope_path, name.replace(" ", "_")
+            )
+            # Determine role (optional: infer from create_task_fn or pass as param)
+            role = getattr(create_task_fn, "role", "Agent")
+            # Setup scoped tools
+            # Allow reading from current scope and parent scope
+            allowed_read_prefixes = []
+            if current_scope_path:
+                allowed_read_prefixes.append(current_scope_path)
+                parent_scope = os.path.dirname(current_scope_path)
+                if parent_scope and parent_scope != ".":
+                    allowed_read_prefixes.append(parent_scope)
+            else:
+                allowed_read_prefixes.append("")  # root
+            allowed_read_prefixes = list(set(allowed_read_prefixes))
+            allowed_write_prefixes = [item_full_scope_path]
+            tools = [
+                scoped_save_artifact,  # Pass the Tool object directly
+                scoped_get_artifact,
+            ]
+            # Pass tools to agent creation for both main and review tasks
+            outputs = run_task_with_review_and_refine(
+                name,
+                desc,
+                lambda n, d: create_task_fn(n, d, tools),
+                lambda t: create_review_fn(t),
+                lambda ctf, n, d, oo, ro, cyc: create_refinement_task(
+                    ctf,
+                    n,
+                    d,
+                    oo,
+                    ro,
+                    cyc,
+                    "Output MUST be a JSON array of objects with 'name' and 'description'.",
+                ),
+                parse_fn,
+                logger,
+                verbose,
+                review_cycles,
+                parse_retries,
+                max_items,
+            )
+            if outputs.get("error"):
+                logger.error(f"Critical error in task '{name}': {outputs['error_msg']}")
+                results.append(
+                    {
+                        "name": name,
+                        "description": desc,
+                        # 'cycles' may be missing in test patches
+                        "cycles": outputs.get("cycles", []),
+                        "final_output": outputs.get("final_output"),
+                        "final_review": outputs.get("final_review"),
+                        "children": [],
+                        "error": True,
+                        "error_msg": outputs.get("error_msg"),
+                    }
+                )
+                break
+            # Use parsed_list directly (do not re-parse)
+            next_items = outputs.get("parsed_list", [])
+            next_results = []
+            if next_level_fn:
+                next_results = next_level_fn(
+                    next_items,
+                    recursion_depth=recursion_depth + 1,
+                    logger=logger,
+                    max_depth=max_depth,
+                    max_items=max_items,
+                    max_tasks=max_tasks,
+                    verbose=verbose,
+                    review_cycles=review_cycles,
+                    parse_retries=parse_retries,
+                    artifact_store=artifact_store,
+                    current_scope_path=item_full_scope_path,
+                )
+            results.append(
+                {
+                    "name": name,
+                    "description": desc,
+                    "cycles": outputs.get("cycles", []),
+                    "final_output": outputs.get("final_output"),
+                    "final_review": outputs.get("final_review"),
+                    "children": next_results,
+                    "error": False,
+                    "error_msg": None,
+                }
+            )
+        return results
 
     return handler
 
@@ -489,15 +564,23 @@ def orchestrate_full_workflow(
 
     # Correct architect_ctf lambda to pass both name and desc
     architect_ctf: Callable[[str, str], Task] = (
-        lambda name, desc: create_architect_task(f"{name}: {desc}", tools=None)  # Pass both name and desc
+        lambda name, desc: create_architect_task(
+            f"{name}: {desc}", tools=None
+        )  # Pass both name and desc
     )
     architect_rtf: Callable[[Task], Task] = lambda t: create_architect_review_task(t)
-    
+
     # Define the create_refine_fn for the architect step
     architect_crf: Callable[
         [Callable[[str, str], Task], str, str, str, str, int], Task
     ] = lambda ctf, n, d, oo, ro, cyc: create_refinement_task(
-        ctf, n, d, oo, ro, cyc, "Output MUST be a JSON array of objects with 'name' and 'description'."
+        ctf,
+        n,
+        d,
+        oo,
+        ro,
+        cyc,
+        "Output MUST be a JSON array of objects with 'name' and 'description'.",
     )
 
     arch_outputs = run_task_with_review_and_refine(
@@ -526,14 +609,26 @@ def orchestrate_full_workflow(
     architecture_review = arch_outputs.get("final_review", "")
 
     # Parse modules list from architect output
-    modules = extract_items_from_pydantic_output(arch_outputs.get("final_output"))
+    # CORRECTED: Use "parsed_list" from arch_outputs
+    modules = arch_outputs.get("parsed_list", [])
+
+    # Ensure modules list doesn't exceed max_items, though run_task_with_review_and_refine
+    # should have handled this if it used parse_fn.
+    if modules:  # Add this check
+        modules = modules[:max_items]
 
     # Build handlers: functions have no children, classes call functions, modules call classes
     function_handler = make_next_level_handler(
         create_function_manager_task,
         create_function_review_task,
         lambda ctf, n, d, oo, ro, cyc: create_refinement_task(
-            ctf, n, d, oo, ro, cyc, "Provide the full code implementation with a docstring."
+            ctf,
+            n,
+            d,
+            oo,
+            ro,
+            cyc,
+            "Provide the full code implementation with a docstring.",
         ),
         extract_items_from_pydantic_output,
         None,
@@ -542,7 +637,13 @@ def orchestrate_full_workflow(
         create_class_manager_task,
         create_class_review_task,
         lambda ctf, n, d, oo, ro, cyc: create_refinement_task(
-            ctf, n, d, oo, ro, cyc, "Output MUST be a JSON array of objects with 'name' and 'description'."
+            ctf,
+            n,
+            d,
+            oo,
+            ro,
+            cyc,
+            "Output MUST be a JSON array of objects with 'name' and 'description'.",
         ),
         extract_items_from_pydantic_output,
         function_handler,
@@ -551,7 +652,13 @@ def orchestrate_full_workflow(
         create_module_manager_task,
         create_module_review_task,
         lambda ctf, n, d, oo, ro, cyc: create_refinement_task(
-            ctf, n, d, oo, ro, cyc, "Output MUST be a JSON array of objects with 'name' and 'description'."
+            ctf,
+            n,
+            d,
+            oo,
+            ro,
+            cyc,
+            "Output MUST be a JSON array of objects with 'name' and 'description'.",
         ),
         extract_items_from_pydantic_output,
         class_handler,
@@ -563,7 +670,13 @@ def orchestrate_full_workflow(
         create_module_manager_task,
         create_module_review_task,
         lambda ctf, n, d, oo, ro, cyc: create_refinement_task(
-            ctf, n, d, oo, ro, cyc, "Output MUST be a JSON array of objects with 'name' and 'description'."
+            ctf,
+            n,
+            d,
+            oo,
+            ro,
+            cyc,
+            "Output MUST be a JSON array of objects with 'name' and 'description'.",
         ),
         extract_items_from_pydantic_output,
         module_handler,

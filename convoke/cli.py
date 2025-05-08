@@ -4,7 +4,7 @@ import logging
 import yaml
 from convoke.utils import setup_logging, ensure_api_keys
 from convoke.store import FileSystemArtifactStore
-from convoke.tools import ScopedGetArtifactTool, ScopedSaveArtifactTool
+from convoke.tools import scoped_get_artifact, scoped_save_artifact
 from convoke.workflow import orchestrate_full_workflow
 from dotenv import load_dotenv
 
@@ -85,12 +85,8 @@ def main():
 
     output_dir = os.path.join(project_path, "output")
     artifact_store = FileSystemArtifactStore(output_dir, logger)
-    system_read_tool = ScopedGetArtifactTool(
-        store=artifact_store, agent_role="System", allowed_read_prefixes=[""]
-    )
-    system_write_tool = ScopedSaveArtifactTool(
-        store=artifact_store, agent_role="System", allowed_write_prefixes=[""]
-    )
+    system_read_tool = scoped_get_artifact
+    system_write_tool = scoped_save_artifact
 
     logger.info("Starting Convoke workflow...")
     results = orchestrate_full_workflow(

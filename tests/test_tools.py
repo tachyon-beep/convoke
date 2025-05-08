@@ -3,7 +3,7 @@ import tempfile
 import json
 import pytest
 from convoke.store import FileSystemArtifactStore
-from convoke.tools import ScopedGetArtifactTool, ScopedSaveArtifactTool
+from convoke.tools import scoped_get_artifact, scoped_save_artifact
 
 
 def setup_store_with_file(tmpdir, rel_path, content):
@@ -19,10 +19,12 @@ def test_scoped_get_allowed(tmp_path):
     content = "test content"
     store = setup_store_with_file(tmpdir, rel, content)
     # tool allowed to read 'folder/'
-    tool = ScopedGetArtifactTool(
-        store=store, agent_role="role", allowed_read_prefixes=["folder/"]
+    result = scoped_get_artifact._run(
+        artifact_path=rel,
+        agent_role="role",
+        allowed_read_prefixes=["folder/"],
+        store=store,
     )
-    result = tool._run(rel)
     assert result == content
 
 
@@ -32,10 +34,12 @@ def test_scoped_get_denied(tmp_path, caplog):
     content = "test content"
     store = setup_store_with_file(tmpdir, rel, content)
     # tool not allowed to read outside prefix
-    tool = ScopedGetArtifactTool(
-        store=store, agent_role="role", allowed_read_prefixes=["other/"]
+    result = scoped_get_artifact._run(
+        artifact_path=rel,
+        agent_role="role",
+        allowed_read_prefixes=["other/"],
+        store=store,
     )
-    result = tool._run(rel)
     assert "Error: Access denied" in result
     assert (
         f"Access DENIED for role 'role'" or "Access DENIED for role role" in caplog.text
@@ -47,10 +51,14 @@ def test_scoped_save_allowed(tmp_path):
     store = FileSystemArtifactStore(base_path=tmpdir)
     rel = "save_dir/out.txt"
     content = "hello"
-    tool = ScopedSaveArtifactTool(
-        store=store, agent_role="writer", allowed_write_prefixes=["save_dir/"]
+    result = scoped_save_artifact._run(
+        artifact_path=rel,
+        content=content,
+        is_json_content=False,
+        agent_role="writer",
+        allowed_write_prefixes=["save_dir/"],
+        store=store,
     )
-    result = tool._run(rel, content, False)
     assert "Artifact saved to save_dir/out.txt" in result
     # verify file was created
     path = os.path.join(tmpdir, rel)
@@ -65,10 +73,14 @@ def test_scoped_save_denied(tmp_path, caplog):
     rel = "save_dir/out.txt"
     content = "hello"
     # prefix does not match
-    tool = ScopedSaveArtifactTool(
-        store=store, agent_role="writer", allowed_write_prefixes=["other_dir/"]
+    result = scoped_save_artifact._run(
+        artifact_path=rel,
+        content=content,
+        is_json_content=False,
+        agent_role="writer",
+        allowed_write_prefixes=["other_dir/"],
+        store=store,
     )
-    result = tool._run(rel, content, False)
     assert "Error: Write access denied" in result
     assert (
         f"Access DENIED for role 'writer'"

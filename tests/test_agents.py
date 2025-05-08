@@ -64,6 +64,7 @@ def test_task_factories():
 
 def test_agent_with_tools():
     artifact_store = FileSystemArtifactStore(base_path="/tmp")
+    # Pass the tool objects directly without trying to call them
     tools = [
         scoped_get_artifact,
         scoped_save_artifact,

@@ -41,11 +41,15 @@ def main():
     safe_name = args.name.replace(" ", "_")
     project_id = f"{safe_name}_{timestamp}"
     project_root = os.path.abspath(os.path.join("projects", project_id))
-    output_dir = os.path.join(project_root, "output")
+
+    # Create project directory structure
+    artifacts_dir = os.path.join(project_root, "artifacts")
+    outputs_dir = os.path.join(project_root, "outputs")
     logs_dir = os.path.join(project_root, "logs")
 
     # Create directories
-    os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(artifacts_dir, exist_ok=True)
+    os.makedirs(outputs_dir, exist_ok=True)
     os.makedirs(logs_dir, exist_ok=True)
 
     # Load and write config template

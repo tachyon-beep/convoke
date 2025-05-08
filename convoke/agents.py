@@ -2,6 +2,9 @@ from crewai import Agent, Task
 from pydantic import BaseModel, Field
 from typing import List, Optional
 from convoke.crewai_tools import BaseTool
+from convoke.tools import scoped_get_artifact, scoped_save_artifact
+from convoke.store import FileSystemArtifactStore
+import logging
 
 
 class ItemDetail(BaseModel):
@@ -11,6 +14,21 @@ class ItemDetail(BaseModel):
 
 class ItemListOutput(BaseModel):
     items: List[ItemDetail]
+
+
+# Initialize the artifact store
+artifact_store = FileSystemArtifactStore(
+    base_path="./artifacts", logger=logging.getLogger(__name__)
+)
+
+
+# Update tools to use the initialized artifact store
+def get_default_tools():
+    # Return the tool objects directly without calling them
+    return [
+        scoped_get_artifact,
+        scoped_save_artifact,
+    ]
 
 
 # --- Agent Definitions ---
@@ -47,6 +65,7 @@ def create_architect_reviewer_agent(tools: Optional[List[BaseTool]] = None):
 
 
 def create_module_manager_agent(tools: Optional[List[BaseTool]] = None):
+    tools = tools or get_default_tools()
     return Agent(
         role="Module Manager",
         goal="Design a module, define its classes, and delegate class design to class managers.",
@@ -237,7 +256,7 @@ def create_class_manager_task(
             f"Output MUST be a JSON object with a single key 'items', whose value is a list of objects, each with 'name' and 'description' fields. "
             f"Example: {{'items': [{{'name': 'ExampleFunction', 'description': 'This is an example.'}}]}}\n"
             f"Do not include any markdown, comments, or any text outside the JSON object itself.\n"
-            f"Finally, use the 'SaveProjectArtifact' tool to save your output JSON to 'class_design.json'."
+            f"Finally, use the 'SaveProjectArtifact' tool to save your output JSON to '{class_name.replace(' ', '_')}_class_design.json'."
         ),
         expected_output="A JSON object with an 'items' key, whose value is a list of objects with 'name' and 'description' fields, strictly conforming to the ItemListOutput schema. No extra text.",
         agent=agent,
@@ -259,13 +278,21 @@ def create_class_review_task(cls_task, tools: Optional[List[BaseTool]] = None):
 
 
 def create_function_manager_task(
-    function_name, function_description, tools: Optional[List[BaseTool]] = None
+    function_name,
+    function_description,
+    class_name="",
+    tools: Optional[List[BaseTool]] = None,
 ):
     agent = create_function_manager_agent(tools)
+    class_design_file = (
+        f"{class_name.replace(' ', '_')}_class_design.json"
+        if class_name
+        else "class_design.json"
+    )
     return Task(
         description=(
             f"You are the Function Manager for function '{function_name}'. Description: {function_description}.\n"
-            f"Use the 'GetProjectArtifact' tool to retrieve your parent class's 'class_design.json' if needed for context.\n"
+            f"Use the 'GetProjectArtifact' tool to retrieve your parent class's '{class_design_file}' if needed for context.\n"
             f"Implement the function/method as specified, providing the full code implementation with a docstring.\n"
             f"Finally, use the 'SaveProjectArtifact' tool to save your code to '{function_name}.py'."
         ),

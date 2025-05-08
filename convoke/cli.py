@@ -2,10 +2,7 @@ import argparse
 import os
 import logging
 import yaml
-from convoke.utils import setup_logging, ensure_api_keys
-from convoke.store import FileSystemArtifactStore
-from convoke.tools import scoped_get_artifact, scoped_save_artifact
-from convoke.workflow import orchestrate_full_workflow
+from convoke.utils import setup_logging, ensure_api_keys, ensure_dir_exists
 from dotenv import load_dotenv
 
 
@@ -16,7 +13,7 @@ def main():
         "--project-path",
         type=str,
         required=True,
-        help="Path to the project directory (contains config.yaml, output/ folder).",
+        help="Path to the project directory (contains config.yaml, artifacts/, outputs/ and logs/ folders).",
     )
     parser.add_argument(
         "--requirements",
@@ -83,8 +80,26 @@ def main():
         else config.get("parse_retries", 1)
     )
 
-    output_dir = os.path.join(project_path, "output")
-    artifact_store = FileSystemArtifactStore(output_dir, logger)
+    # Create project directory structure
+    logs_dir = os.path.join(project_path, "logs")
+    artifacts_dir = os.path.join(project_path, "artifacts")
+    outputs_dir = os.path.join(project_path, "outputs")
+
+    # Ensure all required directories exist
+    ensure_dir_exists(logs_dir)
+    ensure_dir_exists(artifacts_dir)
+    ensure_dir_exists(outputs_dir)
+
+    # Set environment variable for artifact path before importing tools
+    os.environ["CONVOKE_ARTIFACTS_DIR"] = artifacts_dir
+
+    # Import these after setting the environment variable
+    from convoke.store import FileSystemArtifactStore
+    from convoke.tools import scoped_get_artifact, scoped_save_artifact
+    from convoke.workflow import orchestrate_full_workflow
+
+    # Initialize the artifact store with the project-specific artifacts directory
+    artifact_store = FileSystemArtifactStore(artifacts_dir, logger)
     system_read_tool = scoped_get_artifact
     system_write_tool = scoped_save_artifact
 
@@ -98,7 +113,7 @@ def main():
         logger=logger,
         review_cycles=review_cycles,
         parse_retries=parse_retries,
-        output_dir=output_dir,
+        output_dir=outputs_dir,  # Use the outputs directory for final products
         artifact_store=artifact_store,
         get_tool=system_read_tool,
         save_tool=system_write_tool,

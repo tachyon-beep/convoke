@@ -120,31 +120,39 @@ def orchestrate_level(
             f"Recursion depth {recursion_depth} exceeds max {max_depth}. Aborting deeper recursion."
         )
         return []
+
+    # Ensure we have a valid artifact store
+    if artifact_store is None:
+        logger.warning(
+            "No artifact store provided to orchestrate_level, creating default store"
+        )
+        artifact_store = FileSystemArtifactStore(
+            base_path="./artifacts", logger=logger, agent_role="orchestrator"
+        )
+
     results = []
     for name, desc in items[:max_items]:
         if task_counter["count"] >= max_tasks:
             logger.warning(f"Task cap reached ({max_tasks}). Halting further spawning.")
             break
+
         # Compute scope for this item
         item_full_scope_path = os.path.join(current_scope_path, name.replace(" ", "_"))
+
         # Determine role (optional: infer from create_task_fn or pass as param)
         role = getattr(create_task_fn, "role", "Agent")
-        # Setup scoped tools
-        # Allow reading from current scope and parent scope
-        allowed_read_prefixes = []
-        if current_scope_path:
-            allowed_read_prefixes.append(current_scope_path)
-            parent_scope = os.path.dirname(current_scope_path)
-            if parent_scope and parent_scope != ".":
-                allowed_read_prefixes.append(parent_scope)
-        else:
-            allowed_read_prefixes.append("")  # root
-        allowed_read_prefixes = list(set(allowed_read_prefixes))
-        allowed_write_prefixes = [item_full_scope_path]
+
+        # Create a scoped child store for this item
+        item_store = artifact_store.create_child_store(
+            scope_path=item_full_scope_path, agent_role=role
+        )
+
+        # Create tools that use the scoped store
         tools = [
-            scoped_save_artifact,  # Pass the Tool object directly
+            scoped_save_artifact,
             scoped_get_artifact,
         ]
+
         # Pass tools to agent creation for both main and review tasks
         outputs = run_task_with_review_and_refine(
             name,
@@ -166,7 +174,9 @@ def orchestrate_level(
             review_cycles,
             parse_retries,
             max_items,
+            scoped_store=item_store,  # Pass the scoped store to run_task_with_review_and_refine
         )
+
         if outputs.get("error"):
             logger.error(f"Critical error in task '{name}': {outputs['error_msg']}")
             results.append(
@@ -183,9 +193,11 @@ def orchestrate_level(
                 }
             )
             break
+
         # Use parsed_list directly (do not re-parse)
         next_items = outputs.get("parsed_list", [])
         next_results = []
+
         if next_level_fn:
             next_results = next_level_fn(
                 next_items,
@@ -197,14 +209,14 @@ def orchestrate_level(
                 verbose=verbose,
                 review_cycles=review_cycles,
                 parse_retries=parse_retries,
-                artifact_store=artifact_store,
+                artifact_store=item_store,  # Pass the item's store to the next level
                 current_scope_path=item_full_scope_path,
             )
+
         results.append(
             {
                 "name": name,
                 "description": desc,
-                # 'cycles' may be missing in test patches
                 "cycles": outputs.get("cycles", []),
                 "final_output": outputs.get("final_output"),
                 "final_review": outputs.get("final_review"),
@@ -213,6 +225,7 @@ def orchestrate_level(
                 "error_msg": None,
             }
         )
+
     return results
 
 
@@ -230,15 +243,30 @@ def run_task_with_review_and_refine(
     review_cycles: int,
     parse_retries: int,
     max_items: int,
+    scoped_store: Optional[FileSystemArtifactStore] = None,
 ) -> Dict[str, Any]:
     outputs = []
     current_output = None
     current_review = None
     error = False
     error_msg = None
+
     for cycle in range(review_cycles):
         if cycle == 0:
+            # Pass tool_params to the task creation function
             task = create_task_fn(name, desc)
+
+            # Attach store to the agent's tools if needed
+            if (
+                scoped_store
+                and hasattr(task, "agent")
+                and task.agent
+                and hasattr(task.agent, "tools")
+            ):
+                for tool in task.agent.tools:
+                    # Set the store parameter in the tool's parameters directly
+                    if hasattr(tool, "params"):
+                        tool.params["store"] = scoped_store
         else:
             task = create_refine_fn(
                 create_task_fn,
@@ -249,6 +277,31 @@ def run_task_with_review_and_refine(
                 cycle,
                 "Output MUST be a JSON array of objects with 'name' and 'description'.",
             )
+
+            # Attach store to the agent's tools if needed
+            if (
+                scoped_store
+                and hasattr(task, "agent")
+                and task.agent
+                and hasattr(task.agent, "tools")
+            ):
+                for tool in task.agent.tools:
+                    # Set the store parameter in the tool's parameters directly
+                    if hasattr(tool, "params"):
+                        tool.params["store"] = scoped_store
+
+        # Also modify the review task to include the store
+        review_task = create_review_fn(task)
+        if (
+            scoped_store
+            and hasattr(review_task, "agent")
+            and review_task.agent
+            and hasattr(review_task.agent, "tools")
+        ):
+            for tool in review_task.agent.tools:
+                if hasattr(tool, "params"):
+                    tool.params["store"] = scoped_store
+
         for attempt in range(parse_retries):
             try:
                 review_task = create_review_fn(task)
@@ -408,12 +461,26 @@ def make_next_level_handler(
         parse_retries: int,
         artifact_store: Optional[FileSystemArtifactStore] = None,
         current_scope_path: str = "",
+        parent_name: str = "",  # Add parent_name parameter
     ) -> List[Dict[str, Any]]:
         if recursion_depth > max_depth:
             logger.warning(
                 f"Recursion depth {recursion_depth} exceeds max {max_depth}. Aborting deeper recursion."
             )
             return []
+
+        # Determine if this is a function handler (which doesn't return child items)
+        is_function_handler = "function" in str(create_task_fn).lower()
+
+        # Ensure we have a valid artifact store
+        if artifact_store is None:
+            logger.warning(
+                "No artifact store provided to handler, creating default store"
+            )
+            artifact_store = FileSystemArtifactStore(
+                base_path="./artifacts", logger=logger, agent_role="orchestrator"
+            )
+
         results = []
         for name, desc in items[:max_items]:
             if task_counter["count"] >= max_tasks:
@@ -421,95 +488,184 @@ def make_next_level_handler(
                     f"Task cap reached ({max_tasks}). Halting further spawning."
                 )
                 break
+
             # Compute scope for this item
             item_full_scope_path = os.path.join(
                 current_scope_path, name.replace(" ", "_")
             )
+
             # Determine role (optional: infer from create_task_fn or pass as param)
             role = getattr(create_task_fn, "role", "Agent")
-            # Setup scoped tools
-            # Allow reading from current scope and parent scope
-            allowed_read_prefixes = []
-            if current_scope_path:
-                allowed_read_prefixes.append(current_scope_path)
-                parent_scope = os.path.dirname(current_scope_path)
-                if parent_scope and parent_scope != ".":
-                    allowed_read_prefixes.append(parent_scope)
-            else:
-                allowed_read_prefixes.append("")  # root
-            allowed_read_prefixes = list(set(allowed_read_prefixes))
-            allowed_write_prefixes = [item_full_scope_path]
+
+            # Create a scoped child store for this item
+            item_store = artifact_store.create_child_store(
+                scope_path=item_full_scope_path, agent_role=role
+            )
+
+            # Create tools that use the scoped store
             tools = [
                 scoped_save_artifact,  # Pass the Tool object directly
                 scoped_get_artifact,
             ]
+
             # Pass tools to agent creation for both main and review tasks
-            outputs = run_task_with_review_and_refine(
-                name,
-                desc,
-                lambda n, d: create_task_fn(n, d, tools),
-                lambda t: create_review_fn(t),
-                lambda ctf, n, d, oo, ro, cyc: create_refinement_task(
-                    ctf,
-                    n,
-                    d,
-                    oo,
-                    ro,
-                    cyc,
-                    "Output MUST be a JSON array of objects with 'name' and 'description'.",
-                ),
-                parse_fn,
-                logger,
-                verbose,
-                review_cycles,
-                parse_retries,
-                max_items,
-            )
-            if outputs.get("error"):
-                logger.error(f"Critical error in task '{name}': {outputs['error_msg']}")
+            # If this is a function handler and we know the parent class name, pass it
+            task_creator = lambda n, d: create_task_fn(n, d, tools)
+
+            # Special handling for function manager to pass class_name
+            if is_function_handler and parent_name:
+                task_creator = lambda n, d: create_task_fn(n, d, parent_name, tools)
+
+            # For function outputs, we use a different approach since they don't return JSON lists
+            # Function managers are leaf nodes that produce Python code, not structured output
+            if is_function_handler:
+                # Use run_task_with_review instead of run_task_with_review_and_refine
+                # since we don't need to parse or extract items from function outputs
+                outputs = run_task_with_review(
+                    task_creator(name, desc),
+                    lambda t: create_review_fn(t),
+                    logger=logger,
+                    verbose=verbose,
+                )
+
+                if outputs.get("error"):
+                    logger.error(
+                        f"Critical error in task '{name}': {outputs['error_msg']}"
+                    )
+                    results.append(
+                        {
+                            "name": name,
+                            "description": desc,
+                            "main_output": outputs.get("main", ""),
+                            "review": outputs.get("review", ""),
+                            "children": [],
+                            "error": True,
+                            "error_msg": outputs.get("error_msg"),
+                        }
+                    )
+                    continue
+
+                # Save code to output directory
+                try:
+                    # Save the function's code to the output directory
+                    code_output = outputs.get("main", "")
+                    if code_output:
+                        # Save Python code to output directory
+                        output_file_path = os.path.join(
+                            current_scope_path, f"{name.replace(' ', '_')}.py"
+                        )
+                        # Also save a JSON metadata file to the artifact store with a summary
+                        function_metadata = {
+                            "name": name,
+                            "description": desc,
+                            "class_name": parent_name,
+                            "summary": f"Implementation of {name} function for {parent_name} class",
+                        }
+                        item_store.save_artifact(
+                            f"{name}_metadata.json",
+                            json.dumps(function_metadata, indent=2),
+                        )
+
+                        # Save the actual code in the artifact store too for reference
+                        item_store.save_artifact(f"{name}.py", code_output)
+
+                        # Also save the review as a separate file
+                        if outputs.get("review"):
+                            item_store.save_artifact(
+                                f"{name}_review.txt", outputs.get("review", "")
+                            )
+                except Exception as e:
+                    logger.error(f"Error saving function code: {e}")
+
+                # For function outputs, we don't have children items to process
                 results.append(
                     {
                         "name": name,
                         "description": desc,
-                        # 'cycles' may be missing in test patches
+                        "main_output": outputs.get("main", ""),
+                        "review": outputs.get("review", ""),
+                        "children": [],
+                        "error": False,
+                        "error_msg": None,
+                    }
+                )
+            else:
+                # Normal processing for non-function outputs (JSON lists)
+                outputs = run_task_with_review_and_refine(
+                    name,
+                    desc,
+                    task_creator,
+                    lambda t: create_review_fn(t),
+                    lambda ctf, n, d, oo, ro, cyc: create_refinement_task(
+                        ctf,
+                        n,
+                        d,
+                        oo,
+                        ro,
+                        cyc,
+                        "Output MUST be a JSON array of objects with 'name' and 'description'.",
+                    ),
+                    parse_fn,
+                    logger,
+                    verbose,
+                    review_cycles,
+                    parse_retries,
+                    max_items,
+                    scoped_store=item_store,  # Pass the scoped store to the task
+                )
+
+                if outputs.get("error"):
+                    logger.error(
+                        f"Critical error in task '{name}': {outputs['error_msg']}"
+                    )
+                    results.append(
+                        {
+                            "name": name,
+                            "description": desc,
+                            # 'cycles' may be missing in test patches
+                            "cycles": outputs.get("cycles", []),
+                            "final_output": outputs.get("final_output"),
+                            "final_review": outputs.get("final_review"),
+                            "children": [],
+                            "error": True,
+                            "error_msg": outputs.get("error_msg"),
+                        }
+                    )
+                    continue
+
+                # Use parsed_list directly (do not re-parse)
+                next_items = outputs.get("parsed_list", [])
+                next_results = []
+
+                if next_level_fn:
+                    next_results = next_level_fn(
+                        next_items,
+                        recursion_depth=recursion_depth + 1,
+                        logger=logger,
+                        max_depth=max_depth,
+                        max_items=max_items,
+                        max_tasks=max_tasks,
+                        verbose=verbose,
+                        review_cycles=review_cycles,
+                        parse_retries=parse_retries,
+                        artifact_store=item_store,  # Pass the item's store to the next level
+                        current_scope_path=item_full_scope_path,
+                        parent_name=name,  # Pass current name as parent to next level
+                    )
+
+                results.append(
+                    {
+                        "name": name,
+                        "description": desc,
                         "cycles": outputs.get("cycles", []),
                         "final_output": outputs.get("final_output"),
                         "final_review": outputs.get("final_review"),
-                        "children": [],
-                        "error": True,
-                        "error_msg": outputs.get("error_msg"),
+                        "children": next_results,
+                        "error": False,
+                        "error_msg": None,
                     }
                 )
-                break
-            # Use parsed_list directly (do not re-parse)
-            next_items = outputs.get("parsed_list", [])
-            next_results = []
-            if next_level_fn:
-                next_results = next_level_fn(
-                    next_items,
-                    recursion_depth=recursion_depth + 1,
-                    logger=logger,
-                    max_depth=max_depth,
-                    max_items=max_items,
-                    max_tasks=max_tasks,
-                    verbose=verbose,
-                    review_cycles=review_cycles,
-                    parse_retries=parse_retries,
-                    artifact_store=artifact_store,
-                    current_scope_path=item_full_scope_path,
-                )
-            results.append(
-                {
-                    "name": name,
-                    "description": desc,
-                    "cycles": outputs.get("cycles", []),
-                    "final_output": outputs.get("final_output"),
-                    "final_review": outputs.get("final_review"),
-                    "children": next_results,
-                    "error": False,
-                    "error_msg": None,
-                }
-            )
+
         return results
 
     return handler
@@ -562,14 +718,6 @@ def orchestrate_full_workflow(
             "error_msg": None,
         }
 
-    # Correct architect_ctf lambda to pass both name and desc
-    architect_ctf: Callable[[str, str], Task] = (
-        lambda name, desc: create_architect_task(
-            f"{name}: {desc}", tools=None
-        )  # Pass both name and desc
-    )
-    architect_rtf: Callable[[Task], Task] = lambda t: create_architect_review_task(t)
-
     # Define the create_refine_fn for the architect step
     architect_crf: Callable[
         [Callable[[str, str], Task], str, str, str, str, int], Task
@@ -583,19 +731,28 @@ def orchestrate_full_workflow(
         "Output MUST be a JSON array of objects with 'name' and 'description'.",
     )
 
+    # Create tools for the Architect with the root artifact store
+    tools = [
+        scoped_save_artifact,
+        scoped_get_artifact,
+    ]
+
+    # Updated to pass tools and artifact_store
     arch_outputs = run_task_with_review_and_refine(
         "System Architecture",
         requirements,
-        architect_ctf,
-        architect_rtf,
-        architect_crf,  # Added the missing create_refine_fn
-        extract_items_from_pydantic_output,  # Use pydantic extractor for architect
+        lambda n, d: create_architect_task(f"{n}: {d}", tools=tools),
+        lambda t: create_architect_review_task(t, tools=tools),
+        architect_crf,
+        extract_items_from_pydantic_output,
         logger,
         verbose,
         review_cycles,
         parse_retries,
-        max_items,  # Ensure max_items is passed
+        max_items,
+        scoped_store=artifact_store,  # Pass the artifact store
     )
+
     if arch_outputs.get("error"):
         # On architect error, return minimal structure
         return {

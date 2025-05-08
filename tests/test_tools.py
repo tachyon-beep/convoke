@@ -18,7 +18,7 @@ def test_scoped_get_allowed(tmp_path):
     rel = "folder/file.txt"
     content = "test content"
     store = setup_store_with_file(tmpdir, rel, content)
-    # tool allowed to read 'folder/'
+    # Use the _run method for testing, not calling the tool directly
     result = scoped_get_artifact._run(
         artifact_path=rel,
         agent_role="role",
@@ -33,7 +33,7 @@ def test_scoped_get_denied(tmp_path, caplog):
     rel = "folder/file.txt"
     content = "test content"
     store = setup_store_with_file(tmpdir, rel, content)
-    # tool not allowed to read outside prefix
+    # Use the _run method for testing, not calling the tool directly
     result = scoped_get_artifact._run(
         artifact_path=rel,
         agent_role="role",
@@ -51,6 +51,7 @@ def test_scoped_save_allowed(tmp_path):
     store = FileSystemArtifactStore(base_path=tmpdir)
     rel = "save_dir/out.txt"
     content = "hello"
+    # Use the _run method for testing, not calling the tool directly
     result = scoped_save_artifact._run(
         artifact_path=rel,
         content=content,
@@ -73,6 +74,7 @@ def test_scoped_save_denied(tmp_path, caplog):
     rel = "save_dir/out.txt"
     content = "hello"
     # prefix does not match
+    # Use the _run method for testing, not calling the tool directly
     result = scoped_save_artifact._run(
         artifact_path=rel,
         content=content,

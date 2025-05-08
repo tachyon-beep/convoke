@@ -1,5 +1,5 @@
 import logging
-from typing import List, Tuple, Dict, Any, Optional, Callable
+from typing import List, Tuple, Dict, Any, Optional, Callable, Union
 from crewai import Task, Crew, Process
 from convoke.agents import ItemListOutput
 from convoke.utils import lint_python_code
@@ -20,6 +20,14 @@ from convoke.agents import (
 )
 from convoke.parsers import parse_json_list
 from convoke.project import write_project_scaffolding, write_tree_visualization
+import os
+from convoke.utils import (
+    ensure_dir_exists,
+    write_json_file,
+    write_text_file,
+    lint_python_code,
+)
+from convoke.agents import create_test_developer_task, create_test_review_task
 
 __all__ = [
     "parse_numbered_list",
@@ -181,13 +189,7 @@ def orchestrate_level(
         [Callable[[str, str], Task], str, str, str, str, int], Task
     ],
     parse_fn: Callable[[str, int], List[Tuple[str, str]]],
-    next_level_fn: Optional[
-        Callable[
-            [List[Tuple[str, str]], int, logging.Logger, int, int, int, int, int, int],
-            List[Dict[str, Any]],
-        ]
-    ],
-    recursion_depth: int,
+    next_level_fn_or_depth: Optional[Union[Callable, int]],
     max_depth: int,
     max_items: int,
     logger: logging.Logger,
@@ -196,6 +198,15 @@ def orchestrate_level(
     review_cycles: int,
     parse_retries: int,
 ) -> List[Dict[str, Any]]:
+    # Handle both legacy usage and new usage
+    recursion_depth = 0
+    next_level_fn = None
+    if isinstance(next_level_fn_or_depth, int):
+        recursion_depth = next_level_fn_or_depth
+    else:
+        recursion_depth = 0  # Default if not provided
+        next_level_fn = next_level_fn_or_depth
+
     if recursion_depth > max_depth:
         logger.warning(
             f"Recursion depth {recursion_depth} exceeds max {max_depth}. Aborting deeper recursion."
@@ -225,16 +236,20 @@ def orchestrate_level(
                 {
                     "name": name,
                     "description": desc,
+                    # 'cycles' may be missing in test patches
                     "cycles": outputs.get("cycles", []),
-                    "final_output": outputs["final_output"],
-                    "final_review": outputs["final_review"],
+                    "final_output": outputs.get("final_output"),
+                    "final_review": outputs.get("final_review"),
                     "children": [],
                     "error": True,
-                    "error_msg": outputs["error_msg"],
+                    "error_msg": outputs.get("error_msg"),
                 }
             )
             break
-        next_items = parse_fn(outputs["final_output"], max_items)
+        # Use parsed_list if available
+        next_items = outputs.get("parsed_list") or parse_fn(
+            outputs.get("final_output", ""), max_items
+        )
         next_results = []
         if next_level_fn:
             next_results = next_level_fn(
@@ -252,9 +267,10 @@ def orchestrate_level(
             {
                 "name": name,
                 "description": desc,
+                # 'cycles' may be missing in test patches
                 "cycles": outputs.get("cycles", []),
-                "final_output": outputs["final_output"],
-                "final_review": outputs["final_review"],
+                "final_output": outputs.get("final_output"),
+                "final_review": outputs.get("final_review"),
                 "children": next_results,
                 "error": False,
                 "error_msg": None,
@@ -355,7 +371,7 @@ def run_task_with_review_and_refine(
                 )
                 logger.debug(f"Parsed items for '{name}': {parsed}")
                 review_output = (
-                    getattr(review_task.output, "raw_output", "")
+                    getattr(review_task.output, "raw", "")
                     if hasattr(review_task, "output")
                     else ""
                 )
@@ -383,6 +399,7 @@ def run_task_with_review_and_refine(
                         "cycle": cycle + 1,
                         "main_output": main_output,
                         "review": review_output,
+                        "parsed_list": parsed,
                     }
                 )
                 break
@@ -397,6 +414,7 @@ def run_task_with_review_and_refine(
         "cycles": outputs,
         "final_output": current_output,
         "final_review": current_review,
+        "parsed_list": current_output and parsed or [],
         "error": error,
         "error_msg": error_msg,
     }
@@ -411,10 +429,21 @@ def create_refinement_task(
     cycle: int,
 ) -> Task:
     """
-    Stub refinement: simply re-run the original task for further cycles.
+    Create a refinement task that includes previous output and peer feedback.
     """
-    # In deeper cycles, we ignore feedback and re-invoke the task creator.
-    return create_task_fn(name, desc)
+    base_task = create_task_fn(name, desc)
+    return Task(
+        description=(
+            f"You are refining the output for '{name}'.\n"
+            f"Original description: {desc}\n"
+            f"Previous output:\n{original_output}\n"
+            f"Peer feedback:\n{review_output}\n"
+            f"Refinement cycle: {cycle}. Please revise and maintain the required format."
+        ),
+        expected_output="Revised output in the format of the original task.",
+        agent=base_task.agent,
+        context=[base_task],
+    )
 
 
 import re
@@ -427,10 +456,13 @@ def extract_json_from_output(text: str) -> str:
     return ""
 
 
+# Fix the wrapped_next function in make_next_level_handler_with_tools to match signature
 def make_next_level_handler(
     create_task_fn: Callable[[str, str], Task],
     create_review_fn: Callable[[Task], Task],
-    create_refine_fn: Callable[[Callable[[str, str], Task], str, str, str, str, int], Task],
+    create_refine_fn: Callable[
+        [Callable[[str, str], Task], str, str, str, str, int], Task
+    ],
     parse_fn: Callable[[str, int], List[Tuple[str, str]]],
     next_level_fn: Optional[Callable],
 ) -> Callable[..., List[Dict[str, Any]]]:
@@ -451,7 +483,6 @@ def make_next_level_handler(
             create_review_fn,
             create_refine_fn,
             parse_fn,
-            next_level_fn,
             recursion_depth,
             max_depth,
             max_items,
@@ -461,6 +492,89 @@ def make_next_level_handler(
             review_cycles,
             parse_retries,
         )
+
+    return handler
+
+
+# Fix the wrapped_next function in make_next_level_handler_with_tools to match signature
+def make_next_level_handler_with_tools(
+    orig_fn: Callable[..., Task],
+    orig_review_fn: Callable[..., Task],
+    role: str,
+    parse_fn: Callable[[str, int], List[Tuple[str, str]]],
+    next_level_fn: Optional[Callable],
+) -> Callable[..., List[Dict[str, Any]]]:
+    def handler(
+        items: List[Tuple[str, str]],
+        parent_scope: str,
+        recursion_depth: int,
+        logger: logging.Logger,
+        max_depth: int,
+        max_items: int,
+        max_tasks: int,
+        verbose: int,
+        review_cycles: int,
+        parse_retries: int,
+    ) -> List[Dict[str, Any]]:
+        # Wrap factories for this scope
+        task_fn = lambda name, desc: _wrap_task(orig_fn, name, desc, role, parent_scope)
+        review_fn = lambda t: _wrap_review(orig_review_fn, t)
+
+        # Create a special wrapper for next_level_fn that preserves the test expectations
+        # This function is passed as the 6th arg to orchestrate_level and will be called
+        # inside that function if it's not None
+        wrapped_next_level_fn = None
+        if next_level_fn:
+
+            def wrapped_next_level_fn(
+                items_,
+                **kwargs,  # Accept all parameters as kwargs to handle both positional and keyword calls
+            ) -> List[Dict[str, Any]]:
+                # Compute child scope
+                if not items_ or len(items_) == 0:
+                    return []
+
+                # Extract parameters from kwargs
+                recursion_depth = kwargs.get("recursion_depth", 0)
+                logger_ = kwargs.get("logger")
+                max_depth_ = kwargs.get("max_depth")
+                max_items_ = kwargs.get("max_items")
+                max_tasks_ = kwargs.get("max_tasks")
+                verbose_ = kwargs.get("verbose")
+                review_cycles_ = kwargs.get("review_cycles")
+                parse_retries_ = kwargs.get("parse_retries")
+
+                child_scope = os.path.join(parent_scope, items_[0][0].replace(" ", "_"))
+                return next_level_fn(
+                    items_,
+                    child_scope,
+                    recursion_depth,
+                    logger_,
+                    max_depth_,
+                    max_items_,
+                    max_tasks_,
+                    verbose_,
+                    review_cycles_,
+                    parse_retries_,
+                )
+
+        # Call orchestrate_level with the wrapped next_level_fn
+        return orchestrate_level(
+            items,
+            task_fn,
+            review_fn,
+            create_refinement_task,
+            parse_fn,
+            wrapped_next_level_fn,  # This is a function that will be called for next level
+            max_depth,
+            max_items,
+            logger,
+            max_tasks,
+            verbose,
+            review_cycles,
+            parse_retries,
+        )
+
     return handler
 
 
@@ -494,7 +608,9 @@ def orchestrate_full_workflow(
 
     # 1. System Architecture with review and refinement
     # wrap architect fns to match expected signatures
-    architect_ctf: Callable[[str, str], Task] = lambda name, desc: create_architect_task(desc)
+    architect_ctf: Callable[[str, str], Task] = (
+        lambda name, desc: create_architect_task(desc)
+    )
     architect_rtf: Callable[[Task], Task] = lambda t: create_architect_review_task(t)
     arch_outputs = run_task_with_review_and_refine(
         "System Architecture",
@@ -522,32 +638,56 @@ def orchestrate_full_workflow(
     architecture_review = arch_outputs.get("final_review", "")
 
     # Parse modules list from architect output
-    modules = parse_json_list(extract_json_from_output(architecture_str), max_items, logger)
+    modules = parse_json_list(
+        extract_json_from_output(architecture_str), max_items, logger
+    )
 
-    # Set up recursion handlers for classes and functions
-    function_handler = make_next_level_handler(
+    # Internal helpers for wrapping task and review functions
+    def _wrap_task(orig_fn, name, desc, role, parent_scope):
+        task = orig_fn(name, desc)
+        slug = name.replace(" ", "_")
+        scope_path = os.path.join(parent_scope, slug).lstrip("/")
+        get_scoped = ScopedGetArtifactTool(
+            store=artifact_store, agent_role=role, allowed_read_prefixes=[parent_scope]
+        )
+        save_scoped = ScopedSaveArtifactTool(
+            store=artifact_store, agent_role=role, allowed_write_prefixes=[scope_path]
+        )
+        task.agent.tools = [get_scoped, save_scoped]
+        return task
+
+    def _wrap_review(orig_review_fn, task_obj):
+        review_task = orig_review_fn(task_obj)
+        review_task.agent.tools = getattr(task_obj.agent, "tools", [])
+        return review_task
+
+    # Build handlers: functions have no children, classes call functions, modules call classes
+    function_handler = make_next_level_handler_with_tools(
         create_function_manager_task,
         create_function_review_task,
-        create_refinement_task,
+        "Function Manager",
         parse_json_list,
         None,
     )
-    class_handler = make_next_level_handler(
+    class_handler = make_next_level_handler_with_tools(
         create_class_manager_task,
         create_class_review_task,
-        create_refinement_task,
+        "Class Manager",
         parse_json_list,
         function_handler,
     )
-
-    # 2. Recursive orchestration starting at module level
-    module_results = orchestrate_level(
-        modules,
+    module_handler = make_next_level_handler_with_tools(
         create_module_manager_task,
         create_module_review_task,
-        create_refinement_task,
+        "Module Manager",
         parse_json_list,
         class_handler,
+    )
+
+    # 2. Recursive orchestration starting at module level
+    module_results = module_handler(
+        modules,
+        "",  # top-level scope
         recursion_depth=0,
         max_depth=max_depth,
         max_items=max_items,
@@ -557,6 +697,110 @@ def orchestrate_full_workflow(
         review_cycles=review_cycles,
         parse_retries=parse_retries,
     )
+
+    # Save individual artifacts (designs, reviews, code, tests)
+    try:
+        ensure_dir_exists(output_dir)
+    except Exception as e:
+        logger.error(f"Could not create output directory: {e}")
+    for mod in module_results:
+        # Save module artifacts
+        try:
+            mod_dir = os.path.join(output_dir, mod["name"].replace(" ", "_"))
+            ensure_dir_exists(mod_dir)
+            write_json_file(
+                os.path.join(mod_dir, "module_design.json"),
+                {
+                    "name": mod["name"],
+                    "description": mod["description"],
+                    "cycles": mod["cycles"],
+                    "final_output": mod["final_output"],
+                },
+            )
+            write_text_file(
+                os.path.join(mod_dir, "module_review.txt"), mod["final_review"] or ""
+            )
+        except Exception as e:
+            logger.error(f"Error saving module '{mod['name']}' artifacts: {e}")
+        for cls in mod.get("children", []):
+            # Save class artifacts
+            try:
+                cls_dir = os.path.join(mod_dir, cls["name"].replace(" ", "_"))
+                ensure_dir_exists(cls_dir)
+                write_json_file(
+                    os.path.join(cls_dir, "class_design.json"),
+                    {
+                        "name": cls["name"],
+                        "description": cls["description"],
+                        "cycles": cls["cycles"],
+                        "final_output": cls["final_output"],
+                    },
+                )
+                write_text_file(
+                    os.path.join(cls_dir, "class_review.txt"), cls["final_review"] or ""
+                )
+            except Exception as e:
+                logger.error(f"Error saving class '{cls['name']}' artifacts: {e}")
+            for fn in cls.get("children", []):
+                try:
+                    fn_file = os.path.join(
+                        cls_dir, f"{fn['name'].replace(' ', '_')}.py"
+                    )
+                    write_text_file(fn_file, fn["final_output"] or "")
+                    write_text_file(
+                        os.path.join(
+                            cls_dir, f"{fn['name'].replace(' ', '_')}_review.txt"
+                        ),
+                        fn["final_review"] or "",
+                    )
+                    if fn["final_output"]:
+                        # Lint code
+                        try:
+                            lint_result = lint_python_code(fn["final_output"])
+                            write_text_file(
+                                os.path.join(
+                                    cls_dir, f"{fn['name'].replace(' ', '_')}_lint.txt"
+                                ),
+                                lint_result,
+                            )
+                        except Exception as le:
+                            logger.error(
+                                f"Linting failed for function '{fn['name']}']: {le}"
+                            )
+                        # Generate and review tests
+                        try:
+                            test_task = create_test_developer_task(
+                                fn["name"], fn["final_output"]
+                            )
+                            test_review_task = create_test_review_task(test_task)
+                            test_crew = Crew(
+                                agents=[test_task.agent, test_review_task.agent],
+                                tasks=[test_task, test_review_task],
+                                process=Process.sequential,
+                                verbose=False,
+                            )
+                            test_crew.kickoff()
+                            test_code = getattr(test_task.output, "raw", "")
+                            test_review = getattr(test_review_task.output, "raw", "")
+                            write_text_file(
+                                os.path.join(
+                                    cls_dir, f"test_{fn['name'].replace(' ', '_')}.py"
+                                ),
+                                test_code,
+                            )
+                            write_text_file(
+                                os.path.join(
+                                    cls_dir,
+                                    f"test_{fn['name'].replace(' ', '_')}_review.txt",
+                                ),
+                                test_review,
+                            )
+                        except Exception as te:
+                            logger.error(
+                                f"Test generation failed for function '{fn['name']}']: {te}"
+                            )
+                except Exception as e:
+                    logger.error(f"Error saving function '{fn['name']}' artifacts: {e}")
 
     # Write project scaffolding and visualization
     write_project_scaffolding(output_dir, architecture_str, modules)

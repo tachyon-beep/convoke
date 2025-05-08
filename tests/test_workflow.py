@@ -98,21 +98,21 @@ def test_orchestrate_level_minimal():
         return [("Child", "desc")] if text else []
 
     logger = logging.getLogger("test")
+    # Call orchestrate_level using positional arguments to match current signature
     results = orchestrate_level(
         [("Parent", "desc")],
         dummy_task_fn,
         dummy_review_fn,
         dummy_refine_fn,
         dummy_parse_fn,
-        None,
-        recursion_depth=1,
-        max_depth=2,
-        max_items=2,
-        logger=logger,
-        max_tasks=10,
-        verbose=0,
-        review_cycles=1,
-        parse_retries=1,
+        1,  # recursion_depth
+        2,  # max_depth
+        2,  # max_items
+        logger,
+        10,  # max_tasks
+        0,  # verbose
+        1,  # review_cycles
+        1,  # parse_retries
     )
     assert results[0]["name"] == "Parent"
     assert results[0]["children"] == []
@@ -181,11 +181,19 @@ def test_orchestrate_full_workflow_minimal(monkeypatch, tmp_path):
         "ClassA": cls_json,
         "funcA": fn_code,
     }
+    # Also create mapping for parsed lists
+    parsed_mapping = {
+        "System Architecture": [("ModuleA", "DescA")],
+        "ModuleA": [("ClassA", "DescClassA")],
+        "ClassA": [("funcA", "DescFuncA")],
+        "funcA": [],
+    }
     monkeypatch.setattr(
         "convoke.workflow.run_task_with_review_and_refine",
         lambda name, desc, *args, **kwargs: {
             "final_output": mapping.get(name, ""),
             "final_review": "reviewed",
+            "parsed_list": parsed_mapping.get(name, []),
             "error": False,
             "error_msg": None,
         },
@@ -233,7 +241,9 @@ def test_orchestrate_full_workflow_empty_requirements(monkeypatch, tmp_path):
         agent = object()
         output = type("Out", (), {"raw_output": "reviewed"})()
 
-    monkeypatch.setattr("convoke.workflow.create_architect_task", lambda req: DummyTask())
+    monkeypatch.setattr(
+        "convoke.workflow.create_architect_task", lambda req: DummyTask()
+    )
     monkeypatch.setattr(
         "convoke.workflow.create_architect_review_task", lambda t: DummyReview()
     )
@@ -309,15 +319,14 @@ def test_orchestrate_level_max_depth():
         dummy_review_fn,
         dummy_refine_fn,
         dummy_parse_fn,
-        None,
-        recursion_depth=10,
-        max_depth=2,
-        max_items=2,
-        logger=logger,
-        max_tasks=10,
-        verbose=0,
-        review_cycles=1,
-        parse_retries=1,
+        10,  # recursion_depth
+        2,  # max_depth
+        2,  # max_items
+        logger,
+        10,  # max_tasks
+        0,  # verbose
+        1,  # review_cycles
+        1,  # parse_retries
     )
     assert results == []
 
@@ -355,15 +364,14 @@ def test_orchestrate_level_max_tasks():
         dummy_review_fn,
         dummy_refine_fn,
         dummy_parse_fn,
-        None,
-        recursion_depth=1,
-        max_depth=2,
-        max_items=2,
-        logger=logger,
-        max_tasks=100,
-        verbose=0,
-        review_cycles=1,
-        parse_retries=1,
+        1,  # recursion_depth
+        2,  # max_depth
+        2,  # max_items
+        logger,
+        100,  # max_tasks
+        0,  # verbose
+        1,  # review_cycles
+        1,  # parse_retries
     )
     assert results == []
     convoke.workflow.task_counter["count"] = 0  # reset for other tests
@@ -384,7 +392,9 @@ def test_orchestrate_full_workflow_error_propagation(monkeypatch, tmp_path):
     def error_review(*a, **k):
         return DummyReview()
 
-    monkeypatch.setattr("convoke.workflow.create_architect_task", lambda req: DummyTask())
+    monkeypatch.setattr(
+        "convoke.workflow.create_architect_task", lambda req: DummyTask()
+    )
     monkeypatch.setattr(
         "convoke.workflow.create_architect_review_task", lambda t: DummyReview()
     )
@@ -414,6 +424,7 @@ def test_orchestrate_full_workflow_error_propagation(monkeypatch, tmp_path):
     )
     # Patch run_task_with_review_and_refine to always return error
     import convoke.workflow
+
     monkeypatch.setattr(
         convoke.workflow,
         "run_task_with_review_and_refine",

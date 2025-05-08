@@ -1,6 +1,7 @@
 from crewai import Agent, Task
 from pydantic import BaseModel, Field
-from typing import List
+from typing import List, Optional
+from convoke.crewai_tools import BaseTool
 
 
 class ItemDetail(BaseModel):
@@ -13,7 +14,7 @@ class ItemListOutput(BaseModel):
 
 
 # --- Agent Definitions ---
-def create_architect_agent():
+def create_architect_agent(tools: Optional[List[BaseTool]] = None):
     return Agent(
         role="Systems Architect",
         goal="Design a robust, modular software system for the given requirements.",
@@ -24,10 +25,11 @@ def create_architect_agent():
         verbose=True,
         allow_delegation=False,
         model="gpt-4o",
+        tools=tools,
     )
 
 
-def create_architect_reviewer_agent():
+def create_architect_reviewer_agent(tools: Optional[List[BaseTool]] = None):
     return Agent(
         role="Architect Reviewer",
         goal="Critique and enhance the system architecture for robustness and clarity.",
@@ -37,10 +39,11 @@ def create_architect_reviewer_agent():
         ),
         verbose=True,
         allow_delegation=False,
+        tools=tools,
     )
 
 
-def create_module_manager_agent():
+def create_module_manager_agent(tools: Optional[List[BaseTool]] = None):
     return Agent(
         role="Module Manager",
         goal="Design a module, define its classes, and delegate class design to class managers.",
@@ -50,10 +53,11 @@ def create_module_manager_agent():
         ),
         verbose=True,
         allow_delegation=True,
+        tools=tools,
     )
 
 
-def create_module_reviewer_agent():
+def create_module_reviewer_agent(tools: Optional[List[BaseTool]] = None):
     return Agent(
         role="Module Reviewer",
         goal="Critique and enhance the module design for cohesion and completeness.",
@@ -63,10 +67,11 @@ def create_module_reviewer_agent():
         ),
         verbose=True,
         allow_delegation=False,
+        tools=tools,
     )
 
 
-def create_class_manager_agent():
+def create_class_manager_agent(tools: Optional[List[BaseTool]] = None):
     return Agent(
         role="Class Manager",
         goal="Design a class, define its functions, and delegate function implementation to function managers.",
@@ -76,10 +81,11 @@ def create_class_manager_agent():
         ),
         verbose=True,
         allow_delegation=True,
+        tools=tools,
     )
 
 
-def create_class_reviewer_agent():
+def create_class_reviewer_agent(tools: Optional[List[BaseTool]] = None):
     return Agent(
         role="Class Reviewer",
         goal="Critique and enhance the class design for clarity and extensibility.",
@@ -89,10 +95,11 @@ def create_class_reviewer_agent():
         ),
         verbose=True,
         allow_delegation=False,
+        tools=tools,
     )
 
 
-def create_function_manager_agent():
+def create_function_manager_agent(tools: Optional[List[BaseTool]] = None):
     return Agent(
         role="Function Manager",
         goal="Implement a function or method as specified by the class manager.",
@@ -103,10 +110,11 @@ def create_function_manager_agent():
         verbose=True,
         allow_delegation=False,
         model="gpt-3.5-turbo",
+        tools=tools,
     )
 
 
-def create_function_reviewer_agent():
+def create_function_reviewer_agent(tools: Optional[List[BaseTool]] = None):
     return Agent(
         role="Function Reviewer",
         goal="Critique and enhance the function implementation for correctness and style.",
@@ -116,10 +124,11 @@ def create_function_reviewer_agent():
         ),
         verbose=True,
         allow_delegation=False,
+        tools=tools,
     )
 
 
-def create_test_developer_agent():
+def create_test_developer_agent(tools: Optional[List[BaseTool]] = None):
     return Agent(
         role="Test Developer",
         goal="Write a unit test for the given function implementation.",
@@ -127,21 +136,24 @@ def create_test_developer_agent():
         verbose=True,
         allow_delegation=False,
         model="gpt-3.5-turbo",
+        tools=tools,
     )
 
 
-def create_test_reviewer_agent():
+def create_test_reviewer_agent(tools: Optional[List[BaseTool]] = None):
     return Agent(
         role="Test Reviewer",
         goal="Critique and enhance the unit test for correctness and coverage.",
         backstory="You are a peer test developer, skilled at reviewing unit tests for completeness and effectiveness.",
         verbose=True,
         allow_delegation=False,
+        tools=tools,
     )
 
 
 # --- Task Definitions ---
-def create_architect_task(requirements):
+def create_architect_task(requirements, tools: Optional[List[BaseTool]] = None):
+    agent = create_architect_agent(tools)
     return Task(
         description=(
             f"Analyze the following requirements and design a modular system. "
@@ -151,24 +163,28 @@ def create_architect_task(requirements):
             f"Requirements: {requirements}"
         ),
         expected_output="A JSON array of objects with 'name' and 'description' fields, and nothing else.",
-        agent=create_architect_agent(),
+        agent=agent,
     )
 
 
-def create_architect_review_task(arch_task):
+def create_architect_review_task(arch_task, tools: Optional[List[BaseTool]] = None):
+    agent = create_architect_reviewer_agent(tools)
     return Task(
         description=(
             "Review the proposed system architecture. Critique its modularity, scalability, and clarity. "
             "Suggest specific improvements or enhancements."
         ),
         expected_output="A critique and enhancement suggestions for the architecture.",
-        agent=create_architect_reviewer_agent(),
+        agent=agent,
         context=[arch_task],
         human_input=True,
     )
 
 
-def create_module_manager_task(module_name, module_description):
+def create_module_manager_task(
+    module_name, module_description, tools: Optional[List[BaseTool]] = None
+):
+    agent = create_module_manager_agent(tools)
     return Task(
         description=(
             f"Design the module '{module_name}': {module_description}. "
@@ -177,24 +193,28 @@ def create_module_manager_task(module_name, module_description):
             f"Do not include any markdown, comments, or any text outside the JSON object itself."
         ),
         expected_output="A JSON object with an 'items' key, whose value is a list of objects with 'name' and 'description' fields, strictly conforming to the ItemListOutput schema. No extra text.",
-        agent=create_module_manager_agent(),
+        agent=agent,
         output_pydantic=ItemListOutput,
     )
 
 
-def create_module_review_task(mod_task):
+def create_module_review_task(mod_task, tools: Optional[List[BaseTool]] = None):
+    agent = create_module_reviewer_agent(tools)
     return Task(
         description=(
             "Review the proposed module design. Critique its cohesion, completeness, and class selection. "
             "Suggest specific improvements or enhancements."
         ),
         expected_output="A critique and enhancement suggestions for the module design.",
-        agent=create_module_reviewer_agent(),
+        agent=agent,
         context=[mod_task],
     )
 
 
-def create_class_manager_task(class_name, class_description):
+def create_class_manager_task(
+    class_name, class_description, tools: Optional[List[BaseTool]] = None
+):
+    agent = create_class_manager_agent(tools)
     return Task(
         description=(
             f"Design the class '{class_name}': {class_description}. "
@@ -203,47 +223,55 @@ def create_class_manager_task(class_name, class_description):
             f"Do not include any markdown, comments, or any text outside the JSON object itself."
         ),
         expected_output="A JSON object with an 'items' key, whose value is a list of objects with 'name' and 'description' fields, strictly conforming to the ItemListOutput schema. No extra text.",
-        agent=create_class_manager_agent(),
+        agent=agent,
         output_pydantic=ItemListOutput,
     )
 
 
-def create_class_review_task(cls_task):
+def create_class_review_task(cls_task, tools: Optional[List[BaseTool]] = None):
+    agent = create_class_reviewer_agent(tools)
     return Task(
         description=(
             "Review the proposed class design. Critique its clarity, extensibility, and method selection. "
             "Suggest specific improvements or enhancements."
         ),
         expected_output="A critique and enhancement suggestions for the class design.",
-        agent=create_class_reviewer_agent(),
+        agent=agent,
         context=[cls_task],
     )
 
 
-def create_function_manager_task(function_name, function_description):
+def create_function_manager_task(
+    function_name, function_description, tools: Optional[List[BaseTool]] = None
+):
+    agent = create_function_manager_agent(tools)
     return Task(
         description=(
             f"Implement the function/method '{function_name}': {function_description}. "
             f"Provide the full code implementation with a docstring."
         ),
         expected_output="The complete code for the function/method, with a docstring.",
-        agent=create_function_manager_agent(),
+        agent=agent,
     )
 
 
-def create_function_review_task(fn_task):
+def create_function_review_task(fn_task, tools: Optional[List[BaseTool]] = None):
+    agent = create_function_reviewer_agent(tools)
     return Task(
         description=(
             "Review the function implementation. Critique its correctness, clarity, and efficiency. "
             "Suggest specific improvements or enhancements."
         ),
         expected_output="A critique and enhancement suggestions for the function implementation.",
-        agent=create_function_reviewer_agent(),
+        agent=agent,
         context=[fn_task],
     )
 
 
-def create_test_developer_task(function_name, function_code):
+def create_test_developer_task(
+    function_name, function_code, tools: Optional[List[BaseTool]] = None
+):
+    agent = create_test_developer_agent(tools)
     return Task(
         description=(
             f"Write a pytest-style unit test for the following function '{function_name}'. "
@@ -251,14 +279,15 @@ def create_test_developer_task(function_name, function_code):
             f"Function implementation:\n{function_code}"
         ),
         expected_output="A complete pytest-style unit test for the function, as a code block.",
-        agent=create_test_developer_agent(),
+        agent=agent,
     )
 
 
-def create_test_review_task(test_task):
+def create_test_review_task(test_task, tools: Optional[List[BaseTool]] = None):
+    agent = create_test_reviewer_agent(tools)
     return Task(
         description="Review the unit test for correctness, coverage, and clarity. Suggest improvements if needed.",
         expected_output="A critique and enhancement suggestions for the unit test.",
-        agent=create_test_reviewer_agent(),
+        agent=agent,
         context=[test_task],
     )
